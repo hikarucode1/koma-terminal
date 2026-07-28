@@ -15,9 +15,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use unicode_width::UnicodeWidthChar;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -98,6 +99,8 @@ struct App {
     /// belongs to.
     scroll_accum: f32,
     wheel_target: PaneId,
+    /// Text the IME is composing for the focused pane, if any.
+    preedit: Preedit,
     theme: Theme,
     /// Reused frame buffer so we're not allocating a Vec per redraw.
     instances: Vec<Inst>,
@@ -120,6 +123,7 @@ impl App {
             font_pt: DEFAULT_FONT_PT,
             scroll_accum: 0.0,
             wheel_target: 0,
+            preedit: Preedit::default(),
             theme: Theme::default(),
             instances: Vec::new(),
         }
@@ -191,7 +195,9 @@ impl App {
             Ok(new_id) => {
                 if self.tree.split(self.focus, axis, new_id) {
                     self.focus = new_id;
+                    self.drop_composition();
                     self.relayout();
+                    self.update_ime_area();
                 } else {
                     // Focus wasn't in the tree; drop the pane we just made.
                     if let Some(mut p) = self.panes.remove(&new_id) {
@@ -223,8 +229,18 @@ impl App {
     fn focus_direction(&mut self, dx: f32, dy: f32) {
         let rects = self.layout();
         if let Some(id) = pane::neighbor(&rects, self.focus, dx, dy) {
-            self.focus = id;
+            self.set_focus(id);
         }
+    }
+
+    /// Moves focus, dropping any composition so it can't land in the wrong pane.
+    fn set_focus(&mut self, id: PaneId) {
+        if self.focus == id {
+            return;
+        }
+        self.focus = id;
+        self.drop_composition();
+        self.update_ime_area();
     }
 
     fn set_font_pt(&mut self, pt: f32) {
@@ -398,7 +414,7 @@ impl App {
         }
         let cur = leaves.iter().position(|&id| id == self.focus).unwrap_or(0) as isize;
         let n = leaves.len() as isize;
-        self.focus = leaves[(cur + step).rem_euclid(n) as usize];
+        self.set_focus(leaves[(cur + step).rem_euclid(n) as usize]);
     }
 
     /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
@@ -461,6 +477,67 @@ impl App {
             .map(|p| p.grid.rows.saturating_sub(1))
             .unwrap_or(10)
             .max(1) as isize
+    }
+
+    /// Grid position where composing text starts: the focused pane's cursor.
+    fn composition_origin(&self) -> Option<(Rect, usize, usize, usize, usize)> {
+        let p = self.panes.get(&self.focus)?;
+        let (cw, ch) = self.cell_size();
+        let cols = ((p.rect.w / cw).floor().max(1.0) as usize).min(p.grid.cols);
+        let rows = ((p.rect.h / ch).floor().max(1.0) as usize).min(p.grid.rows);
+        Some((p.rect, p.grid.cx.min(cols.saturating_sub(1)), p.grid.cy, cols, rows))
+    }
+
+    /// Tells the OS where to park the candidate window, so it tracks the caret
+    /// instead of sitting in a corner.
+    fn update_ime_area(&self) {
+        let (Some(window), Some((rect, cx, cy, cols, _rows))) =
+            (self.window.as_ref(), self.composition_origin())
+        else {
+            return;
+        };
+        let (cw, ch) = self.cell_size();
+        // Anchor to the end of the composing text, which is where the caret is.
+        let cells = layout_preedit(&self.preedit.text, self.preedit.target, (cx, cy), cols, usize::MAX);
+        let (col, row) = preedit_caret(&cells, (cx, cy), cols);
+        window.set_ime_cursor_area(
+            PhysicalPosition::new(rect.x + col as f32 * cw, rect.y + row as f32 * ch),
+            PhysicalSize::new(cw, ch),
+        );
+    }
+
+    fn handle_ime(&mut self, ime: Ime) {
+        match ime {
+            Ime::Enabled => self.update_ime_area(),
+            Ime::Preedit(text, target) => {
+                self.preedit.text = text;
+                self.preedit.target = target;
+                self.update_ime_area();
+                self.request_redraw();
+            }
+            Ime::Commit(text) => {
+                // Composition finished: only now does the shell hear about it.
+                self.preedit.clear();
+                if let Some(p) = self.panes.get_mut(&self.focus) {
+                    p.grid.view_offset = 0;
+                    p.pty.write(text.as_bytes());
+                }
+                self.update_ime_area();
+                self.request_redraw();
+            }
+            Ime::Disabled => {
+                self.preedit.clear();
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Abandons any composition, e.g. when focus moves to another pane.
+    fn drop_composition(&mut self) {
+        if self.preedit.is_active() {
+            self.preedit.clear();
+            self.request_redraw();
+        }
     }
 
     fn pane_at(&self, px: f32, py: f32) -> Option<PaneId> {
@@ -591,8 +668,13 @@ impl App {
                 }
             }
 
+            // While the IME is composing, the caret belongs to the composition,
+            // so the terminal's own cursor stands down.
+            let composing = focused && self.preedit.is_active();
+
             // Cursor, live screen only.
-            if g.cursor_visible && g.view_offset == 0 && g.cy < rows && g.cx < max_cols {
+            if !composing && g.cursor_visible && g.view_offset == 0 && g.cy < rows && g.cx < max_cols
+            {
                 let px = rect.x + g.cx as f32 * cw;
                 let py = rect.y + g.cy as f32 * ch;
                 let thickness = (2.0 * scale).max(1.0);
@@ -624,6 +706,50 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+
+            // Composing text, drawn over the grid. It is not in the pty yet, so
+            // it exists only here until the IME commits.
+            if composing {
+                let origin = (g.cx.min(max_cols.saturating_sub(1)), g.cy);
+                let cells =
+                    layout_preedit(&self.preedit.text, self.preedit.target, origin, max_cols, rows);
+                let thin = scale.max(1.0);
+                let thick = (2.0 * scale).max(2.0);
+
+                for pc in &cells {
+                    let px = rect.x + pc.col as f32 * cw;
+                    let py = rect.y + pc.row as f32 * ch;
+                    let span = cw * pc.width as f32;
+
+                    inst.push(Inst::solid(px, py, span, ch, to_linear(theme.preedit_bg, 1.0)));
+                    if let Some(gi) = fonts.glyph(pc.c, false) {
+                        inst.push(Inst::glyph(
+                            [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h],
+                            gi.uv,
+                            to_linear(theme.fg, 1.0),
+                        ));
+                    }
+                    // The active segment gets a heavier rule, the rest a thin
+                    // one — the usual way IMEs show what is being converted.
+                    let (h, col) = if pc.active {
+                        (thick, theme.cursor)
+                    } else {
+                        (thin, theme.preedit_underline)
+                    };
+                    inst.push(Inst::solid(px, py + ch - h, span, h, to_linear(col, 1.0)));
+                }
+
+                let (col, row) = preedit_caret(&cells, origin, max_cols);
+                if row < rows {
+                    inst.push(Inst::solid(
+                        rect.x + col as f32 * cw,
+                        rect.y + row as f32 * ch,
+                        thin,
+                        ch,
+                        to_linear(theme.cursor, 1.0),
+                    ));
                 }
             }
 
@@ -714,6 +840,86 @@ fn leader_shift(m: ModifiersState) -> Option<bool> {
     Some(cmd && m.shift_key())
 }
 
+/// Text the IME is still composing. It belongs to the terminal, not the shell:
+/// nothing is written to the pty until the IME commits it.
+#[derive(Default)]
+struct Preedit {
+    text: String,
+    /// Byte range within `text` that the IME marks as the active segment
+    /// (変換対象). `None` means the IME wants no cursor shown.
+    target: Option<(usize, usize)>,
+}
+
+impl Preedit {
+    fn is_active(&self) -> bool {
+        !self.text.is_empty()
+    }
+    fn clear(&mut self) {
+        self.text.clear();
+        self.target = None;
+    }
+}
+
+/// One composed character placed on the grid.
+#[derive(Debug, PartialEq)]
+struct PreeditCell {
+    col: usize,
+    row: usize,
+    c: char,
+    /// Columns occupied — 2 for full-width characters.
+    width: usize,
+    /// Inside the IME's active segment, which is drawn more prominently.
+    active: bool,
+}
+
+/// Places composing text on the grid starting at `start`, wrapping within
+/// `cols` and stopping at `rows`. Full-width characters take two columns and
+/// wrap as a unit rather than being split across the edge.
+fn layout_preedit(
+    text: &str,
+    target: Option<(usize, usize)>,
+    start: (usize, usize),
+    cols: usize,
+    rows: usize,
+) -> Vec<PreeditCell> {
+    let mut out = Vec::new();
+    if cols == 0 || rows == 0 {
+        return out;
+    }
+    let (mut col, mut row) = start;
+    col = col.min(cols.saturating_sub(1));
+
+    for (byte, c) in text.char_indices() {
+        if c == '\n' || c == '\r' {
+            continue;
+        }
+        let width = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+        if col + width > cols {
+            col = 0;
+            row += 1;
+        }
+        if row >= rows {
+            break;
+        }
+        let active = target.is_some_and(|(t0, t1)| byte >= t0 && byte < t1);
+        out.push(PreeditCell { col, row, c, width, active });
+        col += width;
+    }
+    out
+}
+
+/// Where the caret sits after `cells`, for drawing and for telling the IME
+/// where to put its candidate window.
+fn preedit_caret(cells: &[PreeditCell], start: (usize, usize), cols: usize) -> (usize, usize) {
+    match cells.last() {
+        None => start,
+        Some(last) => {
+            let col = last.col + last.width;
+            if col >= cols { (0, last.row + 1) } else { (col, last.row) }
+        }
+    }
+}
+
 /// Adds a sub-line scroll delta to `accum` and takes out whole lines, leaving
 /// the remainder behind. A trackpad sends a few pixels per event — far less
 /// than one row — so without carrying the remainder every scroll would round
@@ -767,6 +973,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         self.scale = window.scale_factor() as f32;
+        // Without this the OS never routes composition to us and Japanese,
+        // Chinese and Korean input simply cannot be typed. winit leaves IME
+        // off by default.
+        window.set_ime_allowed(true);
 
         let fonts = match FontSet::new(self.font_pt * self.scale) {
             Ok(f) => f,
@@ -838,6 +1048,8 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
 
+            WindowEvent::Ime(ime) => self.handle_ime(ime),
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
@@ -869,7 +1081,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if state == ElementState::Pressed && button == MouseButton::Left {
                     if let Some(id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) {
                         if id != self.focus {
-                            self.focus = id;
+                            self.set_focus(id);
                             self.update_title();
                             self.request_redraw();
                         }
@@ -1051,5 +1263,110 @@ mod tests {
         assert_eq!(out.len(), 32 * 3);
         let out = alternate_scroll_bytes(isize::MIN, false);
         assert_eq!(out.len(), 32 * 3, "the extreme negative must not overflow");
+    }
+
+    /// `(col, row, char)` triples, for readable assertions.
+    fn placed(cells: &[PreeditCell]) -> Vec<(usize, usize, char)> {
+        cells.iter().map(|c| (c.col, c.row, c.c)).collect()
+    }
+
+    #[test]
+    fn composing_text_starts_at_the_caret() {
+        let cells = layout_preedit("abc", None, (5, 2), 80, 24);
+        assert_eq!(placed(&cells), vec![(5, 2, 'a'), (6, 2, 'b'), (7, 2, 'c')]);
+    }
+
+    #[test]
+    fn kana_takes_two_columns_each() {
+        let cells = layout_preedit("にほん", None, (0, 0), 80, 24);
+        assert_eq!(placed(&cells), vec![(0, 0, 'に'), (2, 0, 'ほ'), (4, 0, 'ん')]);
+        assert!(cells.iter().all(|c| c.width == 2));
+    }
+
+    #[test]
+    fn composing_text_wraps_at_the_pane_edge() {
+        let cells = layout_preedit("abcd", None, (2, 0), 4, 24);
+        assert_eq!(placed(&cells), vec![(2, 0, 'a'), (3, 0, 'b'), (0, 1, 'c'), (1, 1, 'd')]);
+    }
+
+    #[test]
+    fn a_wide_char_wraps_whole_rather_than_splitting() {
+        // One column left, but 'あ' needs two — it must move to the next row
+        // intact instead of straddling the edge.
+        let cells = layout_preedit("あ", None, (3, 0), 4, 24);
+        assert_eq!(placed(&cells), vec![(0, 1, 'あ')]);
+    }
+
+    #[test]
+    fn composing_text_stops_at_the_bottom_of_the_pane() {
+        // Two rows only: everything past them is dropped, not drawn off-pane.
+        let cells = layout_preedit("abcdef", None, (0, 0), 2, 2);
+        assert!(cells.iter().all(|c| c.row < 2), "{:?}", placed(&cells));
+        assert_eq!(cells.len(), 4);
+    }
+
+    #[test]
+    fn the_active_segment_is_marked_by_byte_range() {
+        // "にほんご": each kana is 3 bytes. Mark the second one.
+        let text = "にほんご";
+        let cells = layout_preedit(text, Some((3, 6)), (0, 0), 80, 24);
+        let active: Vec<char> = cells.iter().filter(|c| c.active).map(|c| c.c).collect();
+        assert_eq!(active, vec!['ほ']);
+    }
+
+    #[test]
+    fn no_segment_is_active_without_a_range() {
+        let cells = layout_preedit("にほん", None, (0, 0), 80, 24);
+        assert!(cells.iter().all(|c| !c.active));
+    }
+
+    #[test]
+    fn an_empty_target_range_marks_nothing() {
+        // IMEs send a zero-width range to mean "caret here", not "select this".
+        let cells = layout_preedit("abc", Some((1, 1)), (0, 0), 80, 24);
+        assert!(cells.iter().all(|c| !c.active));
+    }
+
+    #[test]
+    fn the_caret_follows_the_composed_text() {
+        let cells = layout_preedit("にほん", None, (1, 0), 80, 24);
+        assert_eq!(preedit_caret(&cells, (1, 0), 80), (7, 0), "1 + three wide chars");
+    }
+
+    #[test]
+    fn the_caret_wraps_when_composing_fills_the_row() {
+        let cells = layout_preedit("abcd", None, (0, 0), 4, 24);
+        assert_eq!(preedit_caret(&cells, (0, 0), 4), (0, 1));
+    }
+
+    #[test]
+    fn an_empty_composition_leaves_the_caret_alone() {
+        let cells = layout_preedit("", None, (7, 3), 80, 24);
+        assert!(cells.is_empty());
+        assert_eq!(preedit_caret(&cells, (7, 3), 80), (7, 3));
+    }
+
+    #[test]
+    fn newlines_in_composing_text_are_ignored() {
+        // Composition is a single run; a stray newline must not break layout.
+        let cells = layout_preedit("a\nb", None, (0, 0), 80, 24);
+        assert_eq!(placed(&cells), vec![(0, 0, 'a'), (1, 0, 'b')]);
+    }
+
+    #[test]
+    fn a_degenerate_pane_produces_no_cells() {
+        assert!(layout_preedit("abc", None, (0, 0), 0, 24).is_empty());
+        assert!(layout_preedit("abc", None, (0, 0), 80, 0).is_empty());
+    }
+
+    #[test]
+    fn preedit_tracks_active_state() {
+        let mut p = Preedit::default();
+        assert!(!p.is_active());
+        p.text = "に".into();
+        p.target = Some((0, 3));
+        assert!(p.is_active());
+        p.clear();
+        assert!(!p.is_active() && p.target.is_none());
     }
 }
