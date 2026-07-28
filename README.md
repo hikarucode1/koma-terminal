@@ -1,8 +1,9 @@
 # koma
 
 A tiling terminal emulator. Panes split a single window so several shells are
-visible at once; each pane owns its own pty and screen. Rendering is a custom
-GPU renderer on wgpu (Metal on macOS, Vulkan on Linux).
+visible at once; each pane owns its own pty and screen. Splitting the same row
+again keeps every pane the same size (1/N each, not 50/25/25). Rendering is a
+custom GPU renderer on wgpu (Metal on macOS, Vulkan on Linux).
 
 ## Running
 
@@ -27,9 +28,18 @@ both platforms, so the same muscle memory works over ssh.
 | `Cmd+[` / `Cmd+]` | Cycle focus |
 | `Cmd+Arrow` | Resize the focused pane's split |
 | `Cmd+` `+` / `-` / `0` | Font size up / down / reset |
-| `Shift+PageUp` / `PageDown` | Scroll back |
-| Mouse wheel | Scroll the pane under the pointer |
+| `Cmd+Shift+Up` / `Down` | Scroll back one line |
+| `Shift+PageUp` / `PageDown` | Scroll back one page |
+| `Cmd+Home` / `End` | Jump to the oldest line / back to the prompt |
+| Mouse wheel, trackpad | Scroll the pane under the pointer |
 | Left click | Focus a pane |
+
+Mac keyboards have no PageUp, so `Cmd+Shift+Up`/`Down` is the binding that
+actually gets used there.
+
+In a full-screen app (vim, less, man) there is no scrollback of ours to show, so
+scrolling sends arrow keys to the program instead — xterm calls this alternate
+scroll.
 
 Everything else is encoded and forwarded to the shell.
 
@@ -37,7 +47,7 @@ Everything else is encoded and forwarded to the shell.
 
 ```
 main.rs    winit event loop, pane bookkeeping, frame building
- ├ pane.rs  binary split tree -> pane rects (the tiling)
+ ├ pane.rs  n-ary split tree -> pane rects (the tiling)
  ├ pty.rs   spawns $SHELL on a pty; a reader thread wakes the event loop
  ├ grid.rs  cell grid + scrollback + the vte::Perform that mutates it
  ├ font.rs  font lookup (fontdb), rasterising (swash), shelf-packed atlas
@@ -64,11 +74,12 @@ coverage.
 cargo test
 ```
 
-46 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
+59 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
 including truecolor, alt screen, wide characters, DSR replies), the split tree
-(layout, non-overlap, collapse-on-close, directional focus), font rasterisation
-and the atlas, and real pty behaviour (a shell's output round-tripping, `stty
-size` seeing the right dimensions, EOF on exit).
+(even sizing across repeated splits, non-overlap, collapse-on-close, directional
+focus), sub-line scroll accumulation, font rasterisation and the atlas, and real
+pty behaviour (a shell's output round-tripping, `stty size` seeing the right
+dimensions, EOF on exit).
 
 The GPU path itself is not covered by tests — it needs a display.
 
@@ -78,6 +89,7 @@ The GPU path itself is not covered by tests — it needs a display.
   coordinates plus `Cmd+C`/`Cmd+V`.
 - **Reflow on resize.** Lines are truncated rather than re-wrapped when the
   window narrows.
+- **A scrollbar**, or any indicator of where you are in the scrollback.
 - **Mouse reporting to the shell**, so vim/tmux can see clicks.
 - **Ligatures / italic face.** Italic currently renders with the regular face.
 - **Config file.** The theme and font size are compiled in (`theme.rs`,

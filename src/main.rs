@@ -1,6 +1,6 @@
 //! koma — a tiling terminal emulator.
 //!
-//! Panes live in a binary split tree; each leaf owns a pty and a screen grid.
+//! Panes live in an n-ary split tree; each leaf owns a pty and a screen grid.
 //! Everything on screen is drawn as instanced quads through one wgpu pipeline.
 
 mod font;
@@ -94,6 +94,10 @@ struct App {
     cursor_pos: (f32, f32),
     scale: f32,
     font_pt: f32,
+    /// Leftover sub-line scroll from the last wheel event, and the pane it
+    /// belongs to.
+    scroll_accum: f32,
+    wheel_target: PaneId,
     theme: Theme,
     /// Reused frame buffer so we're not allocating a Vec per redraw.
     instances: Vec<Inst>,
@@ -114,6 +118,8 @@ impl App {
             cursor_pos: (0.0, 0.0),
             scale: 1.0,
             font_pt: DEFAULT_FONT_PT,
+            scroll_accum: 0.0,
+            wheel_target: 0,
             theme: Theme::default(),
             instances: Vec::new(),
         }
@@ -246,18 +252,14 @@ impl App {
             // Scrollback needs no leader beyond Shift.
             if self.mods.shift_key() {
                 if let Key::Named(n) = key {
-                    let page = self
-                        .panes
-                        .get(&self.focus)
-                        .map(|p| p.grid.rows.saturating_sub(1))
-                        .unwrap_or(10) as isize;
+                    let page = self.page_lines();
                     match n {
                         NamedKey::PageUp => {
-                            self.scroll(page);
+                            self.scroll_focused(page);
                             return true;
                         }
                         NamedKey::PageDown => {
-                            self.scroll(-page);
+                            self.scroll_focused(-page);
                             return true;
                         }
                         _ => {}
@@ -272,6 +274,42 @@ impl App {
         let shift = self.mods.shift_key();
 
         if let Key::Named(n) = key {
+            // Scrollback. Mac keyboards have no PageUp, so Cmd+Shift+Arrow is
+            // the binding that actually gets used there.
+            if shift && !alt {
+                match n {
+                    NamedKey::ArrowUp => {
+                        self.scroll_focused(1);
+                        return true;
+                    }
+                    NamedKey::ArrowDown => {
+                        self.scroll_focused(-1);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            match n {
+                NamedKey::PageUp => {
+                    let page = self.page_lines();
+                    self.scroll_focused(page);
+                    return true;
+                }
+                NamedKey::PageDown => {
+                    let page = self.page_lines();
+                    self.scroll_focused(-page);
+                    return true;
+                }
+                NamedKey::Home => {
+                    self.scroll_to_edge(true);
+                    return true;
+                }
+                NamedKey::End => {
+                    self.scroll_to_edge(false);
+                    return true;
+                }
+                _ => {}
+            }
             match n {
                 NamedKey::ArrowLeft if alt => {
                     self.focus_direction(-1.0, 0.0);
@@ -362,15 +400,52 @@ impl App {
         self.focus = leaves[(cur + step).rem_euclid(n) as usize];
     }
 
-    fn scroll(&mut self, lines: isize) {
-        let Some(p) = self.panes.get_mut(&self.focus) else { return };
-        // The alternate screen (vim, less) scrolls itself; don't fight it.
+    /// Scrolls a pane's viewport. Positive `lines` moves back through history.
+    fn scroll_pane(&mut self, id: PaneId, lines: isize) {
+        let Some(p) = self.panes.get_mut(&id) else { return };
+        if lines == 0 {
+            return;
+        }
         if p.grid.alt_active {
+            // Full-screen apps (vim, less, man) keep no scrollback of ours, so
+            // send arrow keys instead — xterm calls this alternate scroll.
+            let seq: &[u8] = match (lines > 0, p.grid.app_cursor_keys) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            let mut out = Vec::new();
+            for _ in 0..lines.unsigned_abs().min(32) {
+                out.extend_from_slice(seq);
+            }
+            p.pty.write(&out);
             return;
         }
         let max = p.grid.scrollback.len() as isize;
         let next = p.grid.view_offset as isize + lines;
         p.grid.view_offset = next.clamp(0, max) as usize;
+    }
+
+    fn scroll_focused(&mut self, lines: isize) {
+        self.scroll_pane(self.focus, lines);
+    }
+
+    /// Jumps to the oldest retained line, or back to the live screen.
+    fn scroll_to_edge(&mut self, top: bool) {
+        let Some(p) = self.panes.get_mut(&self.focus) else { return };
+        if p.grid.alt_active {
+            return;
+        }
+        p.grid.view_offset = if top { p.grid.scrollback.len() } else { 0 };
+    }
+
+    fn page_lines(&self) -> isize {
+        self.panes
+            .get(&self.focus)
+            .map(|p| p.grid.rows.saturating_sub(1))
+            .unwrap_or(10)
+            .max(1) as isize
     }
 
     fn pane_at(&self, px: f32, py: f32) -> Option<PaneId> {
@@ -584,6 +659,20 @@ impl App {
     }
 }
 
+/// Adds a sub-line scroll delta to `accum` and takes out whole lines, leaving
+/// the remainder behind. A trackpad sends a few pixels per event — far less
+/// than one row — so without carrying the remainder every scroll would round
+/// to zero and nothing would move.
+fn take_whole_lines(accum: &mut f32, delta: f32) -> isize {
+    if !delta.is_finite() {
+        return 0;
+    }
+    *accum += delta;
+    let whole = accum.trunc();
+    *accum -= whole;
+    whole as isize
+}
+
 /// True when cell `x` is the left half of a double-width character.
 fn is_wide(row: &[Cell], x: usize) -> bool {
     row.get(x + 1).is_some_and(|n| n.flags & FLAG_WIDE_SPACER != 0)
@@ -735,6 +824,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let (_, ch) = self.cell_size();
+                // Positive means "reveal content above", i.e. go back in history.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y * 3.0,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / ch,
@@ -742,10 +832,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // Scroll whatever is under the pointer, not just the focused pane.
                 let target =
                     self.pane_at(self.cursor_pos.0, self.cursor_pos.1).unwrap_or(self.focus);
-                let saved = std::mem::replace(&mut self.focus, target);
-                self.scroll(lines.round() as isize);
-                self.focus = saved;
-                self.request_redraw();
+                if target != self.wheel_target {
+                    self.wheel_target = target;
+                    self.scroll_accum = 0.0;
+                }
+                // A trackpad reports a few pixels per event — well under one
+                // row — so the remainder has to carry over between events or
+                // every scroll rounds away to nothing.
+                let whole = take_whole_lines(&mut self.scroll_accum, lines);
+                if whole != 0 {
+                    self.scroll_pane(target, whole);
+                    self.request_redraw();
+                }
             }
 
             WindowEvent::RedrawRequested => self.redraw(),
@@ -764,4 +862,70 @@ fn main() -> Result<()> {
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_trackpad_deltas_accumulate_into_a_scroll() {
+        // A gentle two-finger swipe: ~4px per event against a ~30px row. Each
+        // one alone is a fraction of a line, so they must add up.
+        let mut accum = 0.0;
+        let per_event = 4.0 / 30.0;
+        let mut moved = 0;
+        for _ in 0..8 {
+            moved += take_whole_lines(&mut accum, per_event);
+        }
+        assert!(moved > 0, "eight small deltas scrolled {moved} lines");
+    }
+
+    #[test]
+    fn a_single_small_delta_scrolls_nothing_yet() {
+        let mut accum = 0.0;
+        assert_eq!(take_whole_lines(&mut accum, 0.3), 0);
+        assert!(accum > 0.0, "the remainder must be kept, not discarded");
+    }
+
+    #[test]
+    fn no_scroll_is_lost_to_rounding() {
+        // Whatever comes in must eventually come out; nothing evaporates.
+        let mut accum = 0.0;
+        let total: f32 = 100.0;
+        let mut moved = 0;
+        for _ in 0..1000 {
+            moved += take_whole_lines(&mut accum, total / 1000.0);
+        }
+        assert!((moved as f32 - total).abs() <= 1.0, "moved {moved} of {total}");
+    }
+
+    #[test]
+    fn direction_is_preserved_across_the_fraction_boundary() {
+        let mut accum = 0.0;
+        assert_eq!(take_whole_lines(&mut accum, -0.6), 0);
+        assert_eq!(take_whole_lines(&mut accum, -0.6), -1);
+    }
+
+    #[test]
+    fn reversing_direction_cancels_the_pending_remainder() {
+        let mut accum = 0.0;
+        take_whole_lines(&mut accum, 0.7);
+        assert_eq!(take_whole_lines(&mut accum, -0.7), 0);
+        assert!(accum.abs() < 0.01, "accum drifted to {accum}");
+    }
+
+    #[test]
+    fn a_mouse_wheel_click_scrolls_immediately() {
+        // LineDelta devices send whole lines; they must not be delayed.
+        let mut accum = 0.0;
+        assert_eq!(take_whole_lines(&mut accum, 3.0), 3);
+    }
+
+    #[test]
+    fn non_finite_deltas_are_ignored() {
+        let mut accum = 0.5;
+        assert_eq!(take_whole_lines(&mut accum, f32::NAN), 0);
+        assert_eq!(accum, 0.5, "a bad delta must not poison the accumulator");
+    }
 }
