@@ -1,0 +1,21 @@
+[package]
+name = "koma"
+version = "0.1.0"
+edition = "2024"
+description = "A tiling terminal emulator with a custom wgpu renderer"
+repository = "https://github.com/hikarucode1/koma-terminal"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+env_logger = "0.11.11"
+fontdb = "0.23.0"
+log = "0.4.33"
+pollster = "1.0.1"
+portable-pty = "0.9.0"
+swash = "0.2.10"
+unicode-width = "0.2.2"
+vte = "0.15.0"
+wgpu = "30.0.0"
+winit = "0.30.13"
