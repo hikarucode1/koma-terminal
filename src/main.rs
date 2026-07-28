@@ -243,12 +243,7 @@ impl App {
 
     /// App-level shortcuts. Returns true if the key was consumed.
     fn handle_shortcut(&mut self, key: &Key, event_loop: &ActiveEventLoop) -> bool {
-        // Cmd on macOS; Ctrl+Shift elsewhere. Both are accepted everywhere so
-        // the same muscle memory works when running this on Linux too.
-        let cmd = self.mods.super_key();
-        let ctrl_shift = self.mods.control_key() && self.mods.shift_key();
-
-        if !cmd && !ctrl_shift {
+        let Some(shift) = leader_shift(self.mods) else {
             // Scrollback needs no leader beyond Shift.
             if self.mods.shift_key() {
                 if let Key::Named(n) = key {
@@ -267,15 +262,14 @@ impl App {
                 }
             }
             return false;
-        }
+        };
 
         let alt = self.mods.alt_key();
-        // With the leader held, Shift picks the other split direction.
-        let shift = self.mods.shift_key();
 
         if let Key::Named(n) = key {
             // Scrollback. Mac keyboards have no PageUp, so Cmd+Shift+Arrow is
-            // the binding that actually gets used there.
+            // the binding that actually gets used there. Linux keeps
+            // Ctrl+Shift+Arrow for resizing and scrolls with Shift+PageUp.
             if shift && !alt {
                 match n {
                     NamedKey::ArrowUp => {
@@ -354,8 +348,15 @@ impl App {
         let Key::Character(s) = key else { return false };
         // Lowercase so Cmd+Shift+D and Cmd+D land in the same arm.
         match s.to_lowercase().as_str() {
+            // Cmd+D / Cmd+Shift+D on macOS. Under the Ctrl+Shift leader the
+            // shifted variant is unreachable, so E is the second split key —
+            // it works under either leader.
             "d" => {
                 self.split_focused(if shift { Axis::Vertical } else { Axis::Horizontal });
+                true
+            }
+            "e" => {
+                self.split_focused(Axis::Vertical);
                 true
             }
             "w" => {
@@ -409,6 +410,11 @@ impl App {
         if p.grid.alt_active {
             // Full-screen apps (vim, less, man) keep no scrollback of ours, so
             // send arrow keys instead — xterm calls this alternate scroll.
+            //
+            // Unconditional only because no mouse reporting exists yet (no
+            // DECSET 1000/1002/1003/1006 in grid.rs). When that lands, an app
+            // with tracking on must get mouse sequences here instead, and
+            // xterm additionally gates the arrow-key fallback on DECSET 1007.
             let seq: &[u8] = match (lines > 0, p.grid.app_cursor_keys) {
                 (true, true) => b"\x1bOA",
                 (true, false) => b"\x1b[A",
@@ -657,6 +663,25 @@ impl App {
             .unwrap_or("koma");
         w.set_title(t);
     }
+}
+
+
+/// Resolves modifiers into "is a shortcut leader held, and is Shift an *extra*
+/// modifier on top of it".
+///
+/// The leader is Cmd on macOS and Ctrl+Shift elsewhere, and both are accepted
+/// on both platforms. That makes Shift ambiguous: under Ctrl+Shift it is part
+/// of the leader, so treating it as a modifier would make every Ctrl+Shift
+/// binding behave like its shifted variant.
+///
+/// Returns `None` when no leader is held.
+fn leader_shift(m: ModifiersState) -> Option<bool> {
+    let cmd = m.super_key();
+    let ctrl_shift = m.control_key() && m.shift_key();
+    if !cmd && !ctrl_shift {
+        return None;
+    }
+    Some(cmd && m.shift_key())
 }
 
 /// Adds a sub-line scroll delta to `accum` and takes out whole lines, leaving
@@ -927,5 +952,43 @@ mod tests {
         let mut accum = 0.5;
         assert_eq!(take_whole_lines(&mut accum, f32::NAN), 0);
         assert_eq!(accum, 0.5, "a bad delta must not poison the accumulator");
+    }
+
+    const CMD: ModifiersState = ModifiersState::SUPER;
+    const CTRL: ModifiersState = ModifiersState::CONTROL;
+    const SHIFT: ModifiersState = ModifiersState::SHIFT;
+    const ALT: ModifiersState = ModifiersState::ALT;
+
+    #[test]
+    fn cmd_alone_is_a_leader_without_extra_shift() {
+        assert_eq!(leader_shift(CMD), Some(false));
+    }
+
+    #[test]
+    fn cmd_plus_shift_reports_shift_as_extra() {
+        assert_eq!(leader_shift(CMD | SHIFT), Some(true));
+    }
+
+    #[test]
+    fn ctrl_shift_is_a_leader_and_its_shift_is_not_extra() {
+        // Regression: reported in review. Counting the leader's own Shift as a
+        // modifier made Ctrl+Shift+Up scroll instead of resize on Linux, and
+        // made every split Vertical because the "shifted" branch always won.
+        assert_eq!(leader_shift(CTRL | SHIFT), Some(false));
+        assert_eq!(leader_shift(CTRL | SHIFT | ALT), Some(false));
+    }
+
+    #[test]
+    fn partial_modifiers_are_not_leaders() {
+        assert_eq!(leader_shift(ModifiersState::empty()), None);
+        assert_eq!(leader_shift(SHIFT), None, "Shift alone belongs to the shell");
+        assert_eq!(leader_shift(CTRL), None, "bare Ctrl must reach the shell as ^C etc.");
+        assert_eq!(leader_shift(ALT), None);
+    }
+
+    #[test]
+    fn cmd_wins_when_both_leaders_are_held() {
+        // Cmd+Shift+Ctrl should still count Shift as extra, since Cmd leads.
+        assert_eq!(leader_shift(CMD | CTRL | SHIFT), Some(true));
     }
 }

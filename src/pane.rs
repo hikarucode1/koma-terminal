@@ -157,6 +157,17 @@ impl Node {
     /// out the freed space; a split left with one child collapses into it.
     /// Returns false if `target` is the root leaf.
     pub fn remove(&mut self, target: PaneId) -> bool {
+        if !self.remove_inner(target) {
+            return false;
+        }
+        // Collapsing a split can leave its child nested inside a grandparent of
+        // the same axis, which would make that group count as one member and
+        // bring back uneven sizing on the next split.
+        self.flatten();
+        true
+    }
+
+    fn remove_inner(&mut self, target: PaneId) -> bool {
         let Node::Split { children, .. } = self else { return false };
         let at = children
             .iter()
@@ -169,7 +180,45 @@ impl Node {
             }
             return true;
         }
-        children.iter_mut().any(|c| c.node.remove(target))
+        children.iter_mut().any(|c| c.node.remove_inner(target))
+    }
+
+    /// Splices same-axis children into their parent, so a row is always one
+    /// flat group. A spliced group's members divide the share it held, which
+    /// keeps every pane exactly where it was on screen.
+    fn flatten(&mut self) {
+        let collapse = {
+            let Node::Split { axis, children } = self else { return };
+            let my_axis = *axis;
+            for c in children.iter_mut() {
+                c.node.flatten();
+            }
+            let mut out: Vec<Child> = Vec::with_capacity(children.len());
+            for child in std::mem::take(children) {
+                match child.node {
+                    Node::Split { axis: inner_axis, children: inner } if inner_axis == my_axis => {
+                        let total: f32 = inner.iter().map(|c| c.weight.max(0.0)).sum();
+                        let total = if total > 0.0 { total } else { inner.len().max(1) as f32 };
+                        for mut grandchild in inner {
+                            grandchild.weight = child.weight * (grandchild.weight.max(0.0) / total);
+                            out.push(grandchild);
+                        }
+                    }
+                    node => out.push(Child { node, weight: child.weight }),
+                }
+            }
+            *children = out;
+            children.len() == 1
+        };
+        if collapse {
+            let only = match self {
+                Node::Split { children, .. } => children.pop(),
+                Node::Leaf(_) => None,
+            };
+            if let Some(only) = only {
+                *self = only.node;
+            }
+        }
     }
 
     /// Nudges the boundary next to `target` within the innermost split of
@@ -521,5 +570,81 @@ mod tests {
             assert!(div.x >= a.x + a.w - 0.01 && div.x + div.w <= b.x + 0.01);
             assert_eq!(div.h, FULL.h);
         }
+    }
+
+    #[test]
+    fn a_collapse_does_not_reintroduce_same_axis_nesting() {
+        // Reported in review: "split right, split down, split right, close one,
+        // split right" used to nest an H group inside the outer H group, so the
+        // nested pair counted as one member and sizing went back to 50/25/25.
+        let mut t = Node::leaf(1);
+        t.split(1, Axis::Horizontal, 2); // H[1,2]
+        t.split(2, Axis::Vertical, 3); // H[1, V[2,3]]
+        t.split(2, Axis::Horizontal, 4); // H[1, V[H[2,4], 3]]
+        t.remove(3); // V collapses; the H must not stay nested
+        t.split(1, Axis::Horizontal, 5);
+
+        let w = widths(&t);
+        assert_eq!(w.len(), 4);
+        assert_even(&w);
+    }
+
+    #[test]
+    fn collapsing_keeps_panes_where_they_were_on_screen() {
+        // Flattening must not shuffle sizes: pane 1 still owns half the width,
+        // and 2 and 4 split the half that the closed pane's column freed up.
+        let mut t = Node::leaf(1);
+        t.split(1, Axis::Horizontal, 2);
+        t.split(2, Axis::Vertical, 3);
+        t.split(2, Axis::Horizontal, 4);
+        t.remove(3);
+
+        let out = layout_of(&t);
+        assert_eq!(out.len(), 3);
+        let by = |id: PaneId| out.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert!((by(1).w - FULL.w / 2.0).abs() <= 2.0, "pane 1 keeps its half");
+        assert_even(&[by(2).w, by(4).w]);
+        assert!((by(2).w - FULL.w / 4.0).abs() <= 3.0);
+        // Every pane now spans the full height, since the V split is gone.
+        for id in [1, 2, 4] {
+            assert!((by(id).h - FULL.h).abs() < 0.01, "pane {id} should be full height");
+        }
+    }
+
+    #[test]
+    fn the_tree_stays_flat_through_repeated_collapses() {
+        let mut t = Node::leaf(1);
+        t.split(1, Axis::Horizontal, 2);
+        t.split(2, Axis::Vertical, 3);
+        t.split(3, Axis::Vertical, 4);
+        t.split(4, Axis::Horizontal, 5);
+        t.remove(5);
+        t.remove(4);
+        t.remove(3);
+        // Back to two panes side by side, with nothing nested in between.
+        let mut leaves = Vec::new();
+        t.leaves(&mut leaves);
+        assert_eq!(leaves, vec![1, 2]);
+        assert_even(&widths(&t));
+
+        t.split(2, Axis::Horizontal, 6);
+        assert_even(&widths(&t));
+    }
+
+    #[test]
+    fn a_cross_axis_split_is_left_nested() {
+        // Flattening must only merge matching axes, never collapse a real
+        // vertical split into its horizontal parent.
+        let mut t = Node::leaf(1);
+        t.split(1, Axis::Horizontal, 2);
+        t.split(2, Axis::Vertical, 3);
+        t.split(3, Axis::Vertical, 4);
+        t.remove(4);
+        let out = layout_of(&t);
+        assert_eq!(out.len(), 3);
+        let by = |id: PaneId| out.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert!((by(1).h - FULL.h).abs() < 0.01, "pane 1 spans full height");
+        assert!(by(2).h < FULL.h * 0.6, "2 and 3 still share a column");
+        assert_even(&[by(2).h, by(3).h]);
     }
 }

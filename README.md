@@ -22,7 +22,7 @@ both platforms, so the same muscle memory works over ssh.
 | Key | Action |
 | --- | --- |
 | `Cmd+D` | Split left/right |
-| `Cmd+Shift+D` | Split top/bottom |
+| `Cmd+Shift+D` / `Cmd+E` | Split top/bottom |
 | `Cmd+W` | Close the focused pane (closing the last one quits) |
 | `Cmd+Alt+Arrow` | Move focus in that direction |
 | `Cmd+[` / `Cmd+]` | Cycle focus |
@@ -36,6 +36,11 @@ both platforms, so the same muscle memory works over ssh.
 
 Mac keyboards have no PageUp, so `Cmd+Shift+Up`/`Down` is the binding that
 actually gets used there.
+
+Under the `Ctrl+Shift` leader, Shift is part of the leader itself and can't also
+select a variant. So on Linux the second split is `Ctrl+Shift+E`, and
+`Ctrl+Shift+Up`/`Down` resizes rather than scrolls — scroll with
+`Shift+PageUp`/`PageDown`, which Linux keyboards actually have.
 
 In a full-screen app (vim, less, man) there is no scrollback of ours to show, so
 scrolling sends arrow keys to the program instead — xterm calls this alternate
@@ -74,10 +79,11 @@ coverage.
 cargo test
 ```
 
-59 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
+68 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
 including truecolor, alt screen, wide characters, DSR replies), the split tree
-(even sizing across repeated splits, non-overlap, collapse-on-close, directional
-focus), sub-line scroll accumulation, font rasterisation and the atlas, and real
+(even sizing across repeated splits and across a close-induced collapse,
+non-overlap, directional focus), leader/modifier resolution, sub-line scroll
+accumulation, font rasterisation and the atlas, and real
 pty behaviour (a shell's output round-tripping, `stty size` seeing the right
 dimensions, EOF on exit).
 
