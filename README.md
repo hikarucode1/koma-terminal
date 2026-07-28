@@ -55,7 +55,8 @@ Everything else is encoded and forwarded to the shell.
 
 IME input works: composing text appears inline at the caret with the active
 segment (変換対象) underlined more heavily, and nothing reaches the shell until
-the IME commits. winit leaves IME off by default, so this needs
+the IME commits. A composition stays bound to the pane it started in, so
+switching panes mid-composition neither drags it along nor loses it. winit leaves IME off by default, so this needs
 `set_ime_allowed(true)` plus handling of `Ime::Preedit`/`Ime::Commit`; during
 composition winit suppresses `KeyboardInput`, so there is no double input.
 

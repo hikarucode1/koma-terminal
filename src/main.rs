@@ -195,7 +195,6 @@ impl App {
             Ok(new_id) => {
                 if self.tree.split(self.focus, axis, new_id) {
                     self.focus = new_id;
-                    self.drop_composition();
                     self.relayout();
                     self.update_ime_area();
                 } else {
@@ -217,12 +216,13 @@ impl App {
         if let Some(mut p) = self.panes.remove(&id) {
             p.pty.kill();
         }
+        self.drop_composition_of(id);
+        self.relayout();
         if self.focus == id {
             let mut leaves = Vec::new();
             self.tree.leaves(&mut leaves);
-            self.focus = leaves.first().copied().unwrap_or(0);
+            self.set_focus(leaves.first().copied().unwrap_or(0));
         }
-        self.relayout();
         true
     }
 
@@ -233,13 +233,13 @@ impl App {
         }
     }
 
-    /// Moves focus, dropping any composition so it can't land in the wrong pane.
+    /// Moves focus. Any in-flight composition stays bound to the pane it
+    /// started in, so it neither follows nor is silently thrown away.
     fn set_focus(&mut self, id: PaneId) {
         if self.focus == id {
             return;
         }
         self.focus = id;
-        self.drop_composition();
         self.update_ime_area();
     }
 
@@ -479,9 +479,15 @@ impl App {
             .max(1) as isize
     }
 
-    /// Grid position where composing text starts: the focused pane's cursor.
+    /// The pane a composition belongs to: its owner, or the focused pane when
+    /// nothing is being composed.
+    fn composing_pane(&self) -> PaneId {
+        self.preedit.owner.unwrap_or(self.focus)
+    }
+
+    /// Grid position where composing text starts: the owning pane's cursor.
     fn composition_origin(&self) -> Option<(Rect, usize, usize, usize, usize)> {
-        let p = self.panes.get(&self.focus)?;
+        let p = self.panes.get(&self.composing_pane())?;
         let (cw, ch) = self.cell_size();
         let cols = ((p.rect.w / cw).floor().max(1.0) as usize).min(p.grid.cols);
         let rows = ((p.rect.h / ch).floor().max(1.0) as usize).min(p.grid.rows);
@@ -510,15 +516,16 @@ impl App {
         match ime {
             Ime::Enabled => self.update_ime_area(),
             Ime::Preedit(text, target) => {
-                self.preedit.text = text;
-                self.preedit.target = target;
+                let focus = self.focus;
+                self.preedit.update(text, target, focus);
                 self.update_ime_area();
                 self.request_redraw();
             }
             Ime::Commit(text) => {
-                // Composition finished: only now does the shell hear about it.
-                self.preedit.clear();
-                if let Some(p) = self.panes.get_mut(&self.focus) {
+                // Composition finished: only now does the shell hear about it,
+                // and it goes to the pane it was composed in.
+                let owner = self.preedit.commit(self.focus);
+                if let Some(p) = self.panes.get_mut(&owner) {
                     p.grid.view_offset = 0;
                     p.pty.write(text.as_bytes());
                 }
@@ -532,9 +539,10 @@ impl App {
         }
     }
 
-    /// Abandons any composition, e.g. when focus moves to another pane.
-    fn drop_composition(&mut self) {
-        if self.preedit.is_active() {
+    /// Abandons a composition whose pane is going away — otherwise it would
+    /// render nowhere and commit into a dead pty.
+    fn drop_composition_of(&mut self, id: PaneId) {
+        if self.preedit.owner == Some(id) {
             self.preedit.clear();
             self.request_redraw();
         }
@@ -670,7 +678,7 @@ impl App {
 
             // While the IME is composing, the caret belongs to the composition,
             // so the terminal's own cursor stands down.
-            let composing = focused && self.preedit.is_active();
+            let composing = self.preedit.is_active() && self.preedit.owner == Some(*id);
 
             // Cursor, live screen only.
             if !composing && g.cursor_visible && g.view_offset == 0 && g.cy < rows && g.cx < max_cols
@@ -848,15 +856,42 @@ struct Preedit {
     /// Byte range within `text` that the IME marks as the active segment
     /// (変換対象). `None` means the IME wants no cursor shown.
     target: Option<(usize, usize)>,
+    /// Pane the composition belongs to. The OS keeps its marked text when
+    /// focus moves between our panes — it has no idea they exist — so the
+    /// composition has to remember where it started, or a later commit would
+    /// land in whichever pane happens to be focused.
+    owner: Option<PaneId>,
 }
 
 impl Preedit {
     fn is_active(&self) -> bool {
         !self.text.is_empty()
     }
+
+    /// Applies an `Ime::Preedit` update. A composition that is *starting* binds
+    /// to `focus`; one already in flight keeps its owner — which matters
+    /// because winit sends an empty preedit immediately before `Ime::Commit`,
+    /// and that must not orphan it.
+    fn update(&mut self, text: String, target: Option<(usize, usize)>, focus: PaneId) {
+        if !self.is_active() && !text.is_empty() {
+            self.owner = Some(focus);
+        }
+        self.text = text;
+        self.target = target;
+    }
+
+    /// Consumes the composition, returning the pane the text belongs to.
+    fn commit(&mut self, fallback: PaneId) -> PaneId {
+        let owner = self.owner.take().unwrap_or(fallback);
+        self.text.clear();
+        self.target = None;
+        owner
+    }
+
     fn clear(&mut self) {
         self.text.clear();
         self.target = None;
+        self.owner = None;
     }
 }
 
@@ -1368,5 +1403,78 @@ mod tests {
         assert!(p.is_active());
         p.clear();
         assert!(!p.is_active() && p.target.is_none());
+    }
+
+    #[test]
+    fn a_composition_binds_to_the_pane_it_started_in() {
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        assert_eq!(p.owner, Some(7));
+    }
+
+    #[test]
+    fn a_composition_in_flight_keeps_its_owner_when_focus_moves() {
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        // Focus moved to pane 9 mid-composition; the text still belongs to 7.
+        p.update("にほ".into(), None, 9);
+        assert_eq!(p.owner, Some(7));
+    }
+
+    #[test]
+    fn the_empty_preedit_before_a_commit_does_not_orphan_it() {
+        // winit sends Preedit("") immediately before Commit. If that cleared
+        // the owner, the commit would fall back to whatever is focused now —
+        // exactly the misdelivery this is meant to prevent.
+        let mut p = Preedit::default();
+        p.update("にほん".into(), None, 7);
+        p.update(String::new(), None, 9);
+        assert_eq!(p.owner, Some(7));
+        assert_eq!(p.commit(9), 7, "commit must go to the composing pane");
+    }
+
+    #[test]
+    fn commit_consumes_the_composition() {
+        let mut p = Preedit::default();
+        p.update("に".into(), Some((0, 3)), 2);
+        assert_eq!(p.commit(2), 2);
+        assert!(!p.is_active());
+        assert_eq!(p.owner, None);
+        assert_eq!(p.target, None);
+    }
+
+    #[test]
+    fn a_fresh_composition_after_a_commit_binds_to_the_new_focus() {
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        p.commit(7);
+        p.update("あ".into(), None, 9);
+        assert_eq!(p.owner, Some(9));
+    }
+
+    #[test]
+    fn a_composition_started_after_a_cancel_rebinds() {
+        // Escape clears the text without a commit; the stale owner must not
+        // capture the next composition.
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        p.update(String::new(), None, 7);
+        p.update("あ".into(), None, 9);
+        assert_eq!(p.owner, Some(9));
+    }
+
+    #[test]
+    fn commit_falls_back_when_nothing_was_composing() {
+        let mut p = Preedit::default();
+        assert_eq!(p.commit(4), 4);
+    }
+
+    #[test]
+    fn clear_drops_the_owner_too() {
+        let mut p = Preedit::default();
+        p.update("に".into(), Some((0, 3)), 3);
+        p.clear();
+        assert!(!p.is_active());
+        assert_eq!(p.owner, None);
     }
 }
