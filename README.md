@@ -54,11 +54,14 @@ Everything else is encoded and forwarded to the shell.
 ## Japanese and other IME input
 
 IME input works: composing text appears inline at the caret with the active
-segment (変換対象) underlined more heavily, and nothing reaches the shell until
-the IME commits. A composition stays bound to the pane it started in, so
-switching panes mid-composition neither drags it along nor loses it. winit leaves IME off by default, so this needs
-`set_ime_allowed(true)` plus handling of `Ime::Preedit`/`Ime::Commit`; during
-composition winit suppresses `KeyboardInput`, so there is no double input.
+segment (変換対象) underlined more heavily, and nothing reaches the shell
+until the IME commits. A composition stays bound to the pane it started in,
+so switching panes mid-composition neither drags it along nor loses it — it
+renders and commits where it began.
+
+winit leaves IME off by default, so this needs `set_ime_allowed(true)` plus
+handling of `Ime::Preedit`/`Ime::Commit`; during composition winit suppresses
+`KeyboardInput`, so there is no double input.
 
 ## How it fits together
 
@@ -92,7 +95,7 @@ coverage.
 cargo test
 ```
 
-95 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
+97 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
 including truecolor, alt screen, wide characters, DSR replies), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll

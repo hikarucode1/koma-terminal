@@ -170,6 +170,10 @@ impl App {
                 p.pty.resize(cols as u16, rows as u16);
             }
         }
+        // Panes just moved, so the IME's anchor is stale. Doing it here covers
+        // resize, scale changes, font size and closing an unfocused pane in one
+        // place, none of which go through set_focus.
+        self.update_ime_area();
     }
 
     fn spawn_pane(&mut self, cols: usize, rows: usize) -> Result<PaneId> {
@@ -497,15 +501,19 @@ impl App {
     /// Tells the OS where to park the candidate window, so it tracks the caret
     /// instead of sitting in a corner.
     fn update_ime_area(&self) {
-        let (Some(window), Some((rect, cx, cy, cols, _rows))) =
+        let (Some(window), Some((rect, cx, cy, cols, rows))) =
             (self.window.as_ref(), self.composition_origin())
         else {
             return;
         };
         let (cw, ch) = self.cell_size();
         // Anchor to the end of the composing text, which is where the caret is.
-        let cells = layout_preedit(&self.preedit.text, self.preedit.target, (cx, cy), cols, usize::MAX);
+        // Clipped to the pane's real row count, the same as the renderer — an
+        // unclipped layout could hand the OS a coordinate outside the window.
+        let cells =
+            layout_preedit(&self.preedit.text, self.preedit.target, (cx, cy), cols, rows);
         let (col, row) = preedit_caret(&cells, (cx, cy), cols);
+        let row = row.min(rows.saturating_sub(1));
         window.set_ime_cursor_area(
             PhysicalPosition::new(rect.x + col as f32 * cw, rect.y + row as f32 * ch),
             PhysicalSize::new(cw, ch),
@@ -518,6 +526,13 @@ impl App {
             Ime::Preedit(text, target) => {
                 let focus = self.focus;
                 self.preedit.update(text, target, focus);
+                // Composing is input, so leave the scrollback the way typing
+                // does. Otherwise the preedit would be drawn at the live
+                // cursor's coordinates, on top of history.
+                let id = self.composing_pane();
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.grid.view_offset = 0;
+                }
                 self.update_ime_area();
                 self.request_redraw();
             }
@@ -860,6 +875,12 @@ struct Preedit {
     /// focus moves between our panes — it has no idea they exist — so the
     /// composition has to remember where it started, or a later commit would
     /// land in whichever pane happens to be focused.
+    ///
+    /// Deliberately outlives an empty `text`: winit sends an empty preedit
+    /// immediately before `Ime::Commit`, and clearing the owner there would
+    /// orphan the commit. So a cancelled composition also leaves a stale owner
+    /// behind — harmless, because only `commit` reads it and the next
+    /// composition rebinds it first.
     owner: Option<PaneId>,
 }
 
@@ -1476,5 +1497,27 @@ mod tests {
         p.clear();
         assert!(!p.is_active());
         assert_eq!(p.owner, None);
+    }
+
+    #[test]
+    fn the_caret_can_land_one_row_past_a_full_pane() {
+        // Why update_ime_area clamps the anchor row: the cells are clipped to
+        // the pane, but the caret that follows them is not, so a composition
+        // that fills the pane puts it on a row that does not exist.
+        let cells = layout_preedit("abcd", None, (0, 0), 2, 2);
+        assert!(cells.iter().all(|c| c.row < 2), "cells are clipped");
+        let (_, row) = preedit_caret(&cells, (0, 0), 2);
+        assert_eq!(row, 2, "one past the last row");
+    }
+
+    #[test]
+    fn clipping_the_layout_bounds_the_anchor() {
+        // Passing the pane's real row count (rather than usize::MAX) is what
+        // keeps the anchor within one row of the pane for any length of text.
+        let rows = 3;
+        let cells = layout_preedit(&"あ".repeat(200), None, (0, 0), 4, rows);
+        assert!(cells.iter().all(|c| c.row < rows));
+        let (_, row) = preedit_caret(&cells, (0, 0), 4);
+        assert!(row <= rows, "anchor row {row} should be at most {rows}");
     }
 }
