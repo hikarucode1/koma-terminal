@@ -2,12 +2,51 @@
 //! channel, waking the winit event loop whenever bytes arrive.
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+/// Shells to try, in order, when `$SHELL` isn't usable. zsh leads because it is
+/// the macOS default; the last is guaranteed by POSIX.
+const SHELL_CANDIDATES: [&str; 3] = ["/bin/zsh", "/bin/bash", "/bin/sh"];
+
+/// Picks the shell to run, given `$SHELL` and a way to ask whether a path
+/// exists. Taking `exists` as a parameter keeps the ordering testable without
+/// depending on which shells happen to be installed.
+///
+/// The previous code fell back to `/bin/zsh` unconditionally, which meant koma
+/// refused to start at all on a Linux box with no zsh and no `$SHELL` — a
+/// container or a bare service session, for instance.
+fn resolve_shell_in(env_shell: Option<String>, exists: impl Fn(&str) -> bool) -> String {
+    if let Some(s) = env_shell {
+        let s = s.trim();
+        // A stale `$SHELL` pointing at an uninstalled shell would reproduce the
+        // very failure this function exists to prevent, so absolute paths are
+        // checked. A bare name like `zsh` is resolved through PATH by the spawn
+        // itself and can't be checked here, so it is passed along as given.
+        if !s.is_empty() && (!s.starts_with('/') || exists(s)) {
+            return s.to_string();
+        }
+    }
+    SHELL_CANDIDATES
+        .iter()
+        .find(|p| exists(p))
+        .map(|p| p.to_string())
+        // Nothing found: hand the OS the POSIX path and let spawn report why.
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+fn resolve_shell(env_shell: Option<String>) -> String {
+    resolve_shell_in(env_shell, |p| Path::new(p).exists())
+}
+
+fn default_shell() -> String {
+    resolve_shell(std::env::var("SHELL").ok())
+}
 
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
@@ -27,11 +66,20 @@ impl Pty {
     where
         F: Fn() + Send + 'static,
     {
+        Self::spawn_with_shell(&default_shell(), cols, rows, wake)
+    }
+
+    /// As `spawn`, with the shell chosen explicitly rather than from `$SHELL`.
+    /// Lets tests drive a specific shell regardless of the environment they
+    /// happen to run under.
+    pub fn spawn_with_shell<F>(shell: &str, cols: u16, rows: u16, wake: F) -> Result<Self>
+    where
+        F: Fn() + Send + 'static,
+    {
         let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
         let pair = native_pty_system().openpty(size)?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = CommandBuilder::new(shell);
         // Login shell, so the user's normal profile applies.
         cmd.arg("-l");
         cmd.env("TERM", "xterm-256color");
@@ -114,9 +162,10 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// Spawns a shell, runs a command, and returns everything it printed.
-    fn run_in_shell(cmd: &str, deadline: Duration) -> String {
-        let mut pty = Pty::spawn(80, 24, || {}).expect("could not open a pty");
+    /// Runs a command in `shell` and returns everything it printed.
+    fn run_in(shell: &str, cmd: &str, deadline: Duration) -> String {
+        let mut pty = Pty::spawn_with_shell(shell, 80, 24, || {})
+            .unwrap_or_else(|e| panic!("could not start {shell:?}: {e}"));
         pty.write(cmd.as_bytes());
 
         let mut out = String::new();
@@ -138,7 +187,7 @@ mod tests {
 
     #[test]
     fn shell_output_comes_back_through_the_pty() {
-        let out = run_in_shell("echo KOMA-OK\n", Duration::from_secs(20));
+        let out = run_in(&default_shell(), "echo KOMA-OK\n", Duration::from_secs(20));
         assert!(out.contains("KOMA-OK"), "shell produced: {out:?}");
     }
 
@@ -189,5 +238,77 @@ mod tests {
         }
         pty.kill();
         assert!(hits.load(Ordering::Acquire) > 0, "the wake callback never fired");
+    }
+
+    #[test]
+    fn an_explicit_shell_wins() {
+        assert_eq!(resolve_shell_in(Some("/usr/bin/fish".into()), |_| true), "/usr/bin/fish");
+    }
+
+    #[test]
+    fn a_bare_shell_name_is_left_for_path_lookup() {
+        // `zsh` is resolved through PATH by the spawn, so we can't check it
+        // here — passing it through unchanged is the only correct behaviour.
+        assert_eq!(resolve_shell_in(Some("zsh".into()), |_| false), "zsh");
+    }
+
+    #[test]
+    fn an_absolute_shell_that_is_gone_falls_back() {
+        // A stale $SHELL left behind by an uninstalled shell would otherwise
+        // reproduce the exact ENOENT this change exists to prevent.
+        let picked = resolve_shell_in(Some("/usr/bin/fish".into()), |p| p == "/bin/bash");
+        assert_eq!(picked, "/bin/bash");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_off() {
+        // The guard used to trim before testing but return the untrimmed value,
+        // so " /bin/bash " passed the check and then failed to spawn.
+        let picked = resolve_shell_in(Some(" /bin/bash ".into()), |p| p == "/bin/bash");
+        assert_eq!(picked, "/bin/bash");
+    }
+
+    #[test]
+    fn a_blank_shell_is_treated_as_unset() {
+        for blank in ["", "   "] {
+            assert_eq!(
+                resolve_shell_in(Some(blank.into()), |_| true),
+                resolve_shell_in(None, |_| true),
+                "{blank:?} should behave exactly like no $SHELL at all"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fallback_walks_the_candidates_in_order() {
+        // Each case removes the previous winner, so the whole order is pinned
+        // by behaviour rather than by restating the constant.
+        assert_eq!(resolve_shell_in(None, |_| true), "/bin/zsh");
+        assert_eq!(resolve_shell_in(None, |p| p != "/bin/zsh"), "/bin/bash");
+        assert_eq!(resolve_shell_in(None, |p| p == "/bin/sh"), "/bin/sh");
+    }
+
+    #[test]
+    fn a_system_with_no_known_shell_still_names_one() {
+        // Nothing sensible is left, so hand the OS the POSIX path and let the
+        // spawn produce a real error rather than panicking here.
+        assert_eq!(resolve_shell_in(None, |_| false), "/bin/sh");
+    }
+
+    #[test]
+    fn the_real_filesystem_yields_a_shell_that_exists() {
+        let shell = resolve_shell(None);
+        assert!(Path::new(&shell).exists(), "picked {shell:?}, which does not exist");
+    }
+
+    #[test]
+    fn a_pty_starts_on_the_fallback_shell() {
+        // The regression itself. Going through spawn_with_shell means this
+        // exercises the fallback even on a machine where $SHELL is set — which
+        // is every developer machine, and was why the first version of this
+        // test passed without touching the code path it claimed to cover.
+        let shell = resolve_shell(None);
+        let out = run_in(&shell, "echo KOMA-OK\n", Duration::from_secs(20));
+        assert!(out.contains("KOMA-OK"), "{shell:?} produced: {out:?}");
     }
 }
