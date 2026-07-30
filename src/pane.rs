@@ -77,18 +77,12 @@ impl Node {
         for pair in rects.windows(2) {
             let (a, b) = (pair[0], pair[1]);
             out.push(match axis {
-                Axis::Horizontal => Rect {
-                    x: a.x + a.w,
-                    y: rect.y,
-                    w: (b.x - (a.x + a.w)).max(1.0),
-                    h: rect.h,
-                },
-                Axis::Vertical => Rect {
-                    x: rect.x,
-                    y: a.y + a.h,
-                    w: rect.w,
-                    h: (b.y - (a.y + a.h)).max(1.0),
-                },
+                Axis::Horizontal => {
+                    Rect { x: a.x + a.w, y: rect.y, w: (b.x - (a.x + a.w)).max(1.0), h: rect.h }
+                }
+                Axis::Vertical => {
+                    Rect { x: rect.x, y: a.y + a.h, w: rect.w, h: (b.y - (a.y + a.h)).max(1.0) }
+                }
             });
         }
         for (child, r) in children.iter().zip(rects.iter()) {
@@ -127,10 +121,7 @@ impl Node {
             Node::Leaf(id) if *id == target => {
                 *self = Node::Split {
                     axis,
-                    children: vec![
-                        Child::new(Node::Leaf(target)),
-                        Child::new(Node::Leaf(new_id)),
-                    ],
+                    children: vec![Child::new(Node::Leaf(target)), Child::new(Node::Leaf(new_id))],
                 };
                 true
             }
@@ -169,9 +160,7 @@ impl Node {
 
     fn remove_inner(&mut self, target: PaneId) -> bool {
         let Node::Split { children, .. } = self else { return false };
-        let at = children
-            .iter()
-            .position(|c| matches!(c.node, Node::Leaf(id) if id == target));
+        let at = children.iter().position(|c| matches!(c.node, Node::Leaf(id) if id == target));
         if let Some(i) = at {
             children.remove(i);
             if children.len() == 1 {
@@ -308,9 +297,7 @@ pub fn neighbor(rects: &[(PaneId, Rect)], from: PaneId, dx: f32, dy: f32) -> Opt
         })
         // Prefer well-aligned panes, then near ones.
         .min_by(|a, b| {
-            (a.2 * 4.0 + a.1)
-                .partial_cmp(&(b.2 * 4.0 + b.1))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            (a.2 * 4.0 + a.1).partial_cmp(&(b.2 * 4.0 + b.1)).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(id, _, _)| *id)
 }
@@ -333,9 +320,8 @@ mod tests {
     }
 
     fn assert_even(sizes: &[f32]) {
-        let (min, max) = sizes.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| {
-            (lo.min(v), hi.max(v))
-        });
+        let (min, max) =
+            sizes.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
         // Rounding to whole pixels can leave a pixel or two of slack.
         assert!(max - min <= 2.0, "sizes should be even, got {sizes:?}");
     }

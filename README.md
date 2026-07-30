@@ -11,13 +11,13 @@ custom GPU renderer on wgpu (Metal on macOS, Vulkan on Linux).
 cargo run --release
 ```
 
-macOS and Linux both work from the same source. There is no bundling step yet —
-see "Making it a .app" below.
+macOS and Linux both work from the same source. There is no bundling step
+yet — see "Making it a .app" below.
 
 ## Keys
 
-The leader is **Cmd** on macOS and **Ctrl+Shift** elsewhere. Both are accepted on
-both platforms, so the same muscle memory works over ssh.
+The leader is **Cmd** on macOS and **Ctrl+Shift** elsewhere. Both are accepted
+on both platforms, so the same muscle memory works over ssh.
 
 | Key | Action |
 | --- | --- |
@@ -43,11 +43,11 @@ select a variant. So on Linux the second split is `Ctrl+Shift+E`, and
 `Ctrl+Shift+Up`/`Down` resizes rather than scrolls — scroll with
 `Shift+PageUp`/`PageDown`, which Linux keyboards actually have.
 
-In a full-screen app (vim, less, man) the application owns the whole viewport and
-we keep no scrollback for it. **Wheel** scrolling is translated into arrow keys
-so the application scrolls itself — xterm calls this alternate scroll. The
-keyboard scrollback keys do nothing there, deliberately: sending a page of
-arrows would move the application's cursor rather than its view.
+In a full-screen app (vim, less, man) the application owns the whole viewport
+and we keep no scrollback for it. **Wheel** scrolling is translated into arrow
+keys so the application scrolls itself — xterm calls this alternate scroll.
+The keyboard scrollback keys do nothing there, deliberately: sending a page
+of arrows would move the application's cursor rather than its view.
 
 Everything else is encoded and forwarded to the shell.
 
@@ -76,13 +76,14 @@ main.rs    winit event loop, pane bookkeeping, frame building
  └ theme.rs colours, xterm-256 palette, sRGB -> linear
 ```
 
-The whole frame — pane backgrounds, cell backgrounds, glyphs, cursor, dividers —
-is one instance buffer and **one draw call**. Each instance is a quad with a
-rect, a colour, and a mode: mode 0 fills flat, mode 1 samples the glyph atlas as
-an alpha mask. That is the entire renderer.
+The whole frame — pane backgrounds, cell backgrounds, glyphs, cursor,
+dividers — is one instance buffer and **one draw call**. Each instance is a
+quad with a rect, a colour, and a mode: mode 0 fills flat, mode 1 samples the
+glyph atlas as an alpha mask. That is the entire renderer.
 
-Glyphs are rasterised on demand into a 2048² R8 atlas and cached forever (until
-the font size changes). Only the atlas rows that changed get uploaded each frame.
+Glyphs are rasterised on demand into a 2048² R8 atlas and cached forever
+(until the font size changes). Only the atlas rows that changed get uploaded
+each frame.
 
 Fonts resolve through a chain: the primary monospace face, a bold face, then
 fallbacks. A character is drawn by the first face whose charmap covers it, which

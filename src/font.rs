@@ -146,10 +146,9 @@ fn load_family(db: &fontdb::Database, families: &[&str], bold: bool) -> Option<F
             style: fontdb::Style::Normal,
         };
         if let Some(id) = db.query(&q) {
-            if let Some(face) = db.with_face_data(id, |data, index| Face {
-                data: Arc::new(data.to_vec()),
-                index,
-            }) {
+            if let Some(face) =
+                db.with_face_data(id, |data, index| Face { data: Arc::new(data.to_vec()), index })
+            {
                 return Some(face);
             }
         }
@@ -165,10 +164,7 @@ impl FontSet {
         let regular = load_family(&db, MONO_FAMILIES, false)
             .or_else(|| {
                 // Last resort: any face the system reports as monospaced.
-                let id = db
-                    .faces()
-                    .find(|f| f.monospaced)
-                    .map(|f| f.id)?;
+                let id = db.faces().find(|f| f.monospaced).map(|f| f.id)?;
                 db.with_face_data(id, |data, index| Face { data: Arc::new(data.to_vec()), index })
             })
             .context("no monospace font found on this system")?;

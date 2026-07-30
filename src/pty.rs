@@ -2,9 +2,9 @@
 //! channel, waking the winit event loop whenever bytes arrive.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::Arc;
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -92,9 +92,7 @@ impl Pty {
         }
         self.cols = cols;
         self.rows = rows;
-        let _ = self
-            .master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
     }
 
     /// True once the shell has exited *and* its output has been fully consumed.

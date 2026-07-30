@@ -476,11 +476,8 @@ impl App {
     }
 
     fn page_lines(&self) -> isize {
-        self.panes
-            .get(&self.focus)
-            .map(|p| p.grid.rows.saturating_sub(1))
-            .unwrap_or(10)
-            .max(1) as isize
+        self.panes.get(&self.focus).map(|p| p.grid.rows.saturating_sub(1)).unwrap_or(10).max(1)
+            as isize
     }
 
     /// The pane a composition belongs to: its owner, or the focused pane when
@@ -510,8 +507,7 @@ impl App {
         // Anchor to the end of the composing text, which is where the caret is.
         // Clipped to the pane's real row count, the same as the renderer — an
         // unclipped layout could hand the OS a coordinate outside the window.
-        let cells =
-            layout_preedit(&self.preedit.text, self.preedit.target, (cx, cy), cols, rows);
+        let cells = layout_preedit(&self.preedit.text, self.preedit.target, (cx, cy), cols, rows);
         let (col, row) = preedit_caret(&cells, (cx, cy), cols);
         let row = row.min(rows.saturating_sub(1));
         window.set_ime_cursor_area(
@@ -1125,11 +1121,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
-                let app_cursor = self
-                    .panes
-                    .get(&self.focus)
-                    .map(|p| p.grid.app_cursor_keys)
-                    .unwrap_or(false);
+                let app_cursor =
+                    self.panes.get(&self.focus).map(|p| p.grid.app_cursor_keys).unwrap_or(false);
                 if let Some(bytes) = input::encode(&event, self.mods, app_cursor) {
                     if let Some(p) = self.panes.get_mut(&self.focus) {
                         // Typing jumps back to the live screen.

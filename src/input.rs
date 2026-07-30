@@ -36,11 +36,7 @@ fn cursor_seq(final_byte: char, m: ModifiersState, app_cursor: bool) -> Vec<u8> 
 
 fn tilde_seq(n: u8, m: ModifiersState) -> Vec<u8> {
     let p = modifier_param(m);
-    if p > 1 {
-        format!("\x1b[{n};{p}~").into_bytes()
-    } else {
-        format!("\x1b[{n}~").into_bytes()
-    }
+    if p > 1 { format!("\x1b[{n};{p}~").into_bytes() } else { format!("\x1b[{n}~").into_bytes() }
 }
 
 /// Maps a character to its control code, e.g. `c` -> 0x03.
