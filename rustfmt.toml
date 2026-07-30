@@ -1,0 +1,7 @@
+max_width = 100
+# Keep short struct literals and calls on one line, which is how this tree is
+# already written. Default rustfmt explodes them across four lines.
+use_small_heuristics = "Max"
+# `cargo fmt` reads the edition from Cargo.toml, but a bare `rustfmt src/x.rs`
+# (an editor on save, for instance) defaults to 2015 without this.
+edition = "2024"

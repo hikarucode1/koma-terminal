@@ -74,11 +74,7 @@ impl Theme {
             16..=231 => {
                 let i = i - 16;
                 let steps = [0u8, 95, 135, 175, 215, 255];
-                [
-                    steps[(i / 36) as usize],
-                    steps[((i % 36) / 6) as usize],
-                    steps[(i % 6) as usize],
-                ]
+                [steps[(i / 36) as usize], steps[((i % 36) / 6) as usize], steps[(i % 6) as usize]]
             }
             232..=255 => {
                 let v = 8 + (i - 232) * 10;
@@ -91,11 +87,7 @@ impl Theme {
 /// sRGB byte -> linear float, matching what an sRGB render target expects.
 fn srgb_channel_to_linear(c: u8) -> f32 {
     let c = c as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
 pub fn to_linear(rgb: [u8; 3], alpha: f32) -> [f32; 4] {

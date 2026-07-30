@@ -507,7 +507,8 @@ impl vte::Perform for Performer<'_> {
             'l' => g.set_mode(private, &flat, false),
             'r' => {
                 let top = arg(0, 1) as usize - 1;
-                let bot = flat.get(1).copied().filter(|&v| v != 0).unwrap_or(g.rows as u16) as usize - 1;
+                let bot =
+                    flat.get(1).copied().filter(|&v| v != 0).unwrap_or(g.rows as u16) as usize - 1;
                 if top < bot && bot < g.rows {
                     g.top = top;
                     g.bot = bot;
@@ -534,8 +535,7 @@ impl vte::Perform for Performer<'_> {
             }
             'n' if flat.first() == Some(&6) => {
                 // Device Status Report: report cursor position.
-                self.reply
-                    .extend_from_slice(format!("\x1b[{};{}R", g.cy + 1, g.cx + 1).as_bytes());
+                self.reply.extend_from_slice(format!("\x1b[{};{}R", g.cy + 1, g.cx + 1).as_bytes());
             }
             'c' => self.reply.extend_from_slice(b"\x1b[?6c"), // identify as a VT102
             _ => {}
@@ -613,11 +613,7 @@ mod tests {
     }
 
     fn row_text(g: &Grid, y: usize) -> String {
-        (0..g.cols)
-            .map(|x| g.cell(x, y).c)
-            .collect::<String>()
-            .trim_end()
-            .to_string()
+        (0..g.cols).map(|x| g.cell(x, y).c).collect::<String>().trim_end().to_string()
     }
 
     #[test]

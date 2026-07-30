@@ -81,8 +81,7 @@ impl Gpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("koma device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults()
-                .using_resolution(adapter.limits()),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             ..Default::default()
         }))
         .context("failed to create GPU device")?;
@@ -115,7 +114,11 @@ impl Gpu {
 
         let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph atlas"),
-            size: wgpu::Extent3d { width: atlas_size, height: atlas_size, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: atlas_size,
+                height: atlas_size,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -168,8 +171,7 @@ impl Gpu {
             ],
         });
 
-        let bind_group =
-            make_bind_group(&device, &bgl, &globals_buf, &atlas_tex, &sampler);
+        let bind_group = make_bind_group(&device, &bgl, &globals_buf, &atlas_tex, &sampler);
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("koma layout"),
@@ -312,8 +314,7 @@ impl Gpu {
         );
         self.ensure_capacity(instances.len());
         if !instances.is_empty() {
-            self.queue
-                .write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(instances));
+            self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(instances));
         }
 
         let mut encoder = self
@@ -379,7 +380,10 @@ fn make_bind_group(
         layout: bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
         ],
     })
