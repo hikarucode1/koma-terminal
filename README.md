@@ -35,16 +35,19 @@ both platforms, so the same muscle memory works over ssh.
 | Left click | Focus a pane |
 
 Mac keyboards have no PageUp, so `Cmd+Shift+Up`/`Down` is the binding that
-actually gets used there.
+actually gets used there. They have no Home/End either — `Cmd+Home`/`End` is
+typed as `Cmd+fn+Left`/`Right`.
 
 Under the `Ctrl+Shift` leader, Shift is part of the leader itself and can't also
 select a variant. So on Linux the second split is `Ctrl+Shift+E`, and
 `Ctrl+Shift+Up`/`Down` resizes rather than scrolls — scroll with
 `Shift+PageUp`/`PageDown`, which Linux keyboards actually have.
 
-In a full-screen app (vim, less, man) there is no scrollback of ours to show, so
-scrolling sends arrow keys to the program instead — xterm calls this alternate
-scroll.
+In a full-screen app (vim, less, man) the application owns the whole viewport and
+we keep no scrollback for it. **Wheel** scrolling is translated into arrow keys
+so the application scrolls itself — xterm calls this alternate scroll. The
+keyboard scrollback keys do nothing there, deliberately: sending a page of
+arrows would move the application's cursor rather than its view.
 
 Everything else is encoded and forwarded to the shell.
 
@@ -79,11 +82,11 @@ coverage.
 cargo test
 ```
 
-68 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
+73 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
 including truecolor, alt screen, wide characters, DSR replies), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
-accumulation, font rasterisation and the atlas, and real
+accumulation, alternate-scroll encoding, font rasterisation and the atlas, and real
 pty behaviour (a shell's output round-tripping, `stty size` seeing the right
 dimensions, EOF on exit).
 

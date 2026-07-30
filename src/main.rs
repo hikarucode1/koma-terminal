@@ -401,36 +401,45 @@ impl App {
         self.focus = leaves[(cur + step).rem_euclid(n) as usize];
     }
 
-    /// Scrolls a pane's viewport. Positive `lines` moves back through history.
+    /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
+    /// back through history.
+    ///
+    /// A no-op on the alternate screen: a full-screen application owns the
+    /// whole viewport and we keep no scrollback for it, so there is nothing to
+    /// move. Wheel input gets special treatment — see `wheel_scroll`.
     fn scroll_pane(&mut self, id: PaneId, lines: isize) {
         let Some(p) = self.panes.get_mut(&id) else { return };
-        if lines == 0 {
-            return;
-        }
-        if p.grid.alt_active {
-            // Full-screen apps (vim, less, man) keep no scrollback of ours, so
-            // send arrow keys instead — xterm calls this alternate scroll.
-            //
-            // Unconditional only because no mouse reporting exists yet (no
-            // DECSET 1000/1002/1003/1006 in grid.rs). When that lands, an app
-            // with tracking on must get mouse sequences here instead, and
-            // xterm additionally gates the arrow-key fallback on DECSET 1007.
-            let seq: &[u8] = match (lines > 0, p.grid.app_cursor_keys) {
-                (true, true) => b"\x1bOA",
-                (true, false) => b"\x1b[A",
-                (false, true) => b"\x1bOB",
-                (false, false) => b"\x1b[B",
-            };
-            let mut out = Vec::new();
-            for _ in 0..lines.unsigned_abs().min(32) {
-                out.extend_from_slice(seq);
-            }
-            p.pty.write(&out);
+        if lines == 0 || p.grid.alt_active {
             return;
         }
         let max = p.grid.scrollback.len() as isize;
         let next = p.grid.view_offset as isize + lines;
         p.grid.view_offset = next.clamp(0, max) as usize;
+    }
+
+    /// Scrolling from the wheel or trackpad. On the alternate screen this turns
+    /// into arrow keys for the application — xterm calls it alternate scroll.
+    ///
+    /// Deliberately wheel-only. Routing the keyboard's scrollback keys through
+    /// here too would make `Shift+PageUp` move an application's *cursor*
+    /// instead of its view, and a page's worth of arrows is not a page anyway.
+    ///
+    /// Unconditional only because no mouse reporting exists yet (no DECSET
+    /// 1000/1002/1003/1006 in grid.rs). When that lands, an application with
+    /// tracking enabled must receive mouse sequences instead, and xterm
+    /// additionally gates the arrow-key fallback on DECSET 1007.
+    fn wheel_scroll(&mut self, id: PaneId, lines: isize) {
+        if lines == 0 {
+            return;
+        }
+        let alt = self.panes.get(&id).is_some_and(|p| p.grid.alt_active);
+        if !alt {
+            self.scroll_pane(id, lines);
+            return;
+        }
+        let Some(p) = self.panes.get_mut(&id) else { return };
+        let bytes = alternate_scroll_bytes(lines, p.grid.app_cursor_keys);
+        p.pty.write(&bytes);
     }
 
     fn scroll_focused(&mut self, lines: isize) {
@@ -665,6 +674,27 @@ impl App {
     }
 }
 
+/// Arrow keys an application should see for `lines` of wheel scrolling on the
+/// alternate screen. Positive scrolls back through the application's own view,
+/// which means Up.
+///
+/// Capped, because one gesture must not be able to inject an unbounded burst of
+/// keystrokes. A single wheel event never legitimately exceeds this.
+fn alternate_scroll_bytes(lines: isize, app_cursor_keys: bool) -> Vec<u8> {
+    const MAX_KEYS: usize = 32;
+    let seq: &[u8] = match (lines > 0, app_cursor_keys) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    let count = lines.unsigned_abs().min(MAX_KEYS);
+    let mut out = Vec::with_capacity(count * seq.len());
+    for _ in 0..count {
+        out.extend_from_slice(seq);
+    }
+    out
+}
 
 /// Resolves modifiers into "is a shortcut leader held, and is Shift an *extra*
 /// modifier on top of it".
@@ -866,7 +896,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // every scroll rounds away to nothing.
                 let whole = take_whole_lines(&mut self.scroll_accum, lines);
                 if whole != 0 {
-                    self.scroll_pane(target, whole);
+                    self.wheel_scroll(target, whole);
                     self.request_redraw();
                 }
             }
@@ -990,5 +1020,36 @@ mod tests {
     fn cmd_wins_when_both_leaders_are_held() {
         // Cmd+Shift+Ctrl should still count Shift as extra, since Cmd leads.
         assert_eq!(leader_shift(CMD | CTRL | SHIFT), Some(true));
+    }
+
+    #[test]
+    fn alternate_scroll_sends_up_for_history_and_down_for_forward() {
+        assert_eq!(alternate_scroll_bytes(1, false), b"\x1b[A".to_vec());
+        assert_eq!(alternate_scroll_bytes(-1, false), b"\x1b[B".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_uses_application_cursor_keys_when_set() {
+        assert_eq!(alternate_scroll_bytes(1, true), b"\x1bOA".to_vec());
+        assert_eq!(alternate_scroll_bytes(-1, true), b"\x1bOB".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_repeats_once_per_line() {
+        assert_eq!(alternate_scroll_bytes(3, false), b"\x1b[A\x1b[A\x1b[A".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_sends_nothing_for_no_movement() {
+        assert!(alternate_scroll_bytes(0, false).is_empty());
+    }
+
+    #[test]
+    fn alternate_scroll_is_capped() {
+        // One gesture must not be able to inject an unbounded keystroke burst.
+        let out = alternate_scroll_bytes(10_000, false);
+        assert_eq!(out.len(), 32 * 3);
+        let out = alternate_scroll_bytes(isize::MIN, false);
+        assert_eq!(out.len(), 32 * 3, "the extreme negative must not overflow");
     }
 }
