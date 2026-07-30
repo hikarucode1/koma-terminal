@@ -51,6 +51,18 @@ arrows would move the application's cursor rather than its view.
 
 Everything else is encoded and forwarded to the shell.
 
+## Japanese and other IME input
+
+IME input works: composing text appears inline at the caret with the active
+segment (変換対象) underlined more heavily, and nothing reaches the shell
+until the IME commits. A composition stays bound to the pane it started in,
+so switching panes mid-composition neither drags it along nor loses it — it
+renders and commits where it began.
+
+winit leaves IME off by default, so this needs `set_ime_allowed(true)` plus
+handling of `Ime::Preedit`/`Ime::Commit`; during composition winit suppresses
+`KeyboardInput`, so there is no double input.
+
 ## How it fits together
 
 ```
@@ -59,6 +71,7 @@ main.rs    winit event loop, pane bookkeeping, frame building
  ├ pty.rs   spawns $SHELL on a pty; a reader thread wakes the event loop
  ├ grid.rs  cell grid + scrollback + the vte::Perform that mutates it
  ├ font.rs  font lookup (fontdb), rasterising (swash), shelf-packed atlas
+ ├ input.rs key events -> pty bytes (xterm encoding)
  ├ gpu.rs   wgpu device, one instanced-quad pipeline
  └ theme.rs colours, xterm-256 palette, sRGB -> linear
 ```
@@ -82,12 +95,14 @@ coverage.
 cargo test
 ```
 
-73 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
+97 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
 including truecolor, alt screen, wide characters, DSR replies), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
-accumulation, alternate-scroll encoding, font rasterisation and the atlas, and real
-pty behaviour (a shell's output round-tripping, `stty size` seeing the right
+accumulation, alternate-scroll encoding, IME composition layout (wrapping, kana
+taking two columns, active-segment byte ranges, caret tracking, and which pane a
+composition commits into), font rasterisation and the atlas, and real pty
+behaviour (a shell's output round-tripping, `stty size` seeing the right
 dimensions, EOF on exit).
 
 The GPU path itself is not covered by tests — it needs a display.
@@ -104,6 +119,8 @@ The GPU path itself is not covered by tests — it needs a display.
 - **Config file.** The theme and font size are compiled in (`theme.rs`,
   `DEFAULT_FONT_PT`).
 - **Tabs**, if you want them on top of panes.
+- **IME candidate window styling.** Position is reported to the OS via
+  `set_ime_cursor_area`, but the candidate list itself is the system's.
 
 ## Making it a .app
 

@@ -15,9 +15,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use unicode_width::UnicodeWidthChar;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -98,6 +99,8 @@ struct App {
     /// belongs to.
     scroll_accum: f32,
     wheel_target: PaneId,
+    /// Text the IME is composing for the focused pane, if any.
+    preedit: Preedit,
     theme: Theme,
     /// Reused frame buffer so we're not allocating a Vec per redraw.
     instances: Vec<Inst>,
@@ -120,6 +123,7 @@ impl App {
             font_pt: DEFAULT_FONT_PT,
             scroll_accum: 0.0,
             wheel_target: 0,
+            preedit: Preedit::default(),
             theme: Theme::default(),
             instances: Vec::new(),
         }
@@ -166,6 +170,10 @@ impl App {
                 p.pty.resize(cols as u16, rows as u16);
             }
         }
+        // Panes just moved, so the IME's anchor is stale. Doing it here covers
+        // resize, scale changes, font size and closing an unfocused pane in one
+        // place, none of which go through set_focus.
+        self.update_ime_area();
     }
 
     fn spawn_pane(&mut self, cols: usize, rows: usize) -> Result<PaneId> {
@@ -191,6 +199,7 @@ impl App {
             Ok(new_id) => {
                 if self.tree.split(self.focus, axis, new_id) {
                     self.focus = new_id;
+                    // relayout() refreshes the IME anchor on its way out.
                     self.relayout();
                 } else {
                     // Focus wasn't in the tree; drop the pane we just made.
@@ -211,20 +220,31 @@ impl App {
         if let Some(mut p) = self.panes.remove(&id) {
             p.pty.kill();
         }
+        self.drop_composition_of(id);
+        self.relayout();
         if self.focus == id {
             let mut leaves = Vec::new();
             self.tree.leaves(&mut leaves);
-            self.focus = leaves.first().copied().unwrap_or(0);
+            self.set_focus(leaves.first().copied().unwrap_or(0));
         }
-        self.relayout();
         true
     }
 
     fn focus_direction(&mut self, dx: f32, dy: f32) {
         let rects = self.layout();
         if let Some(id) = pane::neighbor(&rects, self.focus, dx, dy) {
-            self.focus = id;
+            self.set_focus(id);
         }
+    }
+
+    /// Moves focus. Any in-flight composition stays bound to the pane it
+    /// started in, so it neither follows nor is silently thrown away.
+    fn set_focus(&mut self, id: PaneId) {
+        if self.focus == id {
+            return;
+        }
+        self.focus = id;
+        self.update_ime_area();
     }
 
     fn set_font_pt(&mut self, pt: f32) {
@@ -398,7 +418,7 @@ impl App {
         }
         let cur = leaves.iter().position(|&id| id == self.focus).unwrap_or(0) as isize;
         let n = leaves.len() as isize;
-        self.focus = leaves[(cur + step).rem_euclid(n) as usize];
+        self.set_focus(leaves[(cur + step).rem_euclid(n) as usize]);
     }
 
     /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
@@ -461,6 +481,92 @@ impl App {
             .map(|p| p.grid.rows.saturating_sub(1))
             .unwrap_or(10)
             .max(1) as isize
+    }
+
+    /// The pane a composition belongs to: its owner, or the focused pane when
+    /// nothing is being composed.
+    fn composing_pane(&self) -> PaneId {
+        self.preedit.owner.unwrap_or(self.focus)
+    }
+
+    /// Grid position where composing text starts: the owning pane's cursor.
+    fn composition_origin(&self) -> Option<(Rect, usize, usize, usize, usize)> {
+        let p = self.panes.get(&self.composing_pane())?;
+        let (cw, ch) = self.cell_size();
+        let cols = ((p.rect.w / cw).floor().max(1.0) as usize).min(p.grid.cols);
+        let rows = ((p.rect.h / ch).floor().max(1.0) as usize).min(p.grid.rows);
+        Some((p.rect, p.grid.cx.min(cols.saturating_sub(1)), p.grid.cy, cols, rows))
+    }
+
+    /// Tells the OS where to park the candidate window, so it tracks the caret
+    /// instead of sitting in a corner.
+    fn update_ime_area(&self) {
+        let (Some(window), Some((rect, cx, cy, cols, rows))) =
+            (self.window.as_ref(), self.composition_origin())
+        else {
+            return;
+        };
+        let (cw, ch) = self.cell_size();
+        // Anchor to the end of the composing text, which is where the caret is.
+        // Clipped to the pane's real row count, the same as the renderer — an
+        // unclipped layout could hand the OS a coordinate outside the window.
+        let cells =
+            layout_preedit(&self.preedit.text, self.preedit.target, (cx, cy), cols, rows);
+        let (col, row) = preedit_caret(&cells, (cx, cy), cols);
+        let row = row.min(rows.saturating_sub(1));
+        window.set_ime_cursor_area(
+            PhysicalPosition::new(rect.x + col as f32 * cw, rect.y + row as f32 * ch),
+            PhysicalSize::new(cw, ch),
+        );
+    }
+
+    fn handle_ime(&mut self, ime: Ime) {
+        match ime {
+            Ime::Enabled => self.update_ime_area(),
+            Ime::Preedit(text, target) => {
+                let focus = self.focus;
+                self.preedit.update(text, target, focus);
+                // Composing is input, so leave the scrollback the way typing
+                // does. Otherwise the preedit would be drawn at the live
+                // cursor's coordinates, on top of history.
+                //
+                // Only for a real composition: an empty preedit also arrives
+                // when the IME is dismissed or the input source changes, and
+                // yanking the view back then would look unprovoked.
+                if self.preedit.is_active() {
+                    let id = self.composing_pane();
+                    if let Some(p) = self.panes.get_mut(&id) {
+                        p.grid.view_offset = 0;
+                    }
+                }
+                self.update_ime_area();
+                self.request_redraw();
+            }
+            Ime::Commit(text) => {
+                // Composition finished: only now does the shell hear about it,
+                // and it goes to the pane it was composed in.
+                let owner = self.preedit.commit(self.focus);
+                if let Some(p) = self.panes.get_mut(&owner) {
+                    p.grid.view_offset = 0;
+                    p.pty.write(text.as_bytes());
+                }
+                self.update_ime_area();
+                self.request_redraw();
+            }
+            Ime::Disabled => {
+                self.preedit.clear();
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Abandons a composition whose pane is going away — otherwise it would
+    /// render nowhere and commit into a dead pty.
+    fn drop_composition_of(&mut self, id: PaneId) {
+        if self.preedit.owner == Some(id) {
+            self.preedit.clear();
+            self.request_redraw();
+        }
     }
 
     fn pane_at(&self, px: f32, py: f32) -> Option<PaneId> {
@@ -573,7 +679,7 @@ impl App {
                         let bold = cell.flags & FLAG_BOLD != 0;
                         if let Some(gi) = fonts.glyph(cell.c, bold) {
                             inst.push(Inst::glyph(
-                                [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h],
+                                glyph_rect(&gi, px, py, ascent),
                                 gi.uv,
                                 to_linear(fg, 1.0),
                             ));
@@ -591,8 +697,17 @@ impl App {
                 }
             }
 
+            // While the IME is composing, the caret belongs to the composition,
+            // so the terminal's own cursor stands down.
+            let composing = self.preedit.is_active() && self.preedit.owner == Some(*id);
+
             // Cursor, live screen only.
-            if g.cursor_visible && g.view_offset == 0 && g.cy < rows && g.cx < max_cols {
+            let show_cursor = !composing
+                && g.cursor_visible
+                && g.view_offset == 0
+                && g.cy < rows
+                && g.cx < max_cols;
+            if show_cursor {
                 let px = rect.x + g.cx as f32 * cw;
                 let py = rect.y + g.cy as f32 * ch;
                 let thickness = (2.0 * scale).max(1.0);
@@ -612,18 +727,57 @@ impl App {
                             let bold = cell.flags & FLAG_BOLD != 0;
                             if let Some(gi) = fonts.glyph(cell.c, bold) {
                                 inst.push(Inst::glyph(
-                                    [
-                                        (px + gi.left).round(),
-                                        (py + ascent - gi.top).round(),
-                                        gi.w,
-                                        gi.h,
-                                    ],
+                                    glyph_rect(&gi, px, py, ascent),
                                     gi.uv,
                                     to_linear(theme.bg, 1.0),
                                 ));
                             }
                         }
                     }
+                }
+            }
+
+            // Composing text, drawn over the grid. It is not in the pty yet, so
+            // it exists only here until the IME commits.
+            if composing {
+                let origin = (g.cx.min(max_cols.saturating_sub(1)), g.cy);
+                let cells =
+                    layout_preedit(&self.preedit.text, self.preedit.target, origin, max_cols, rows);
+                let thin = scale.max(1.0);
+                let thick = (2.0 * scale).max(2.0);
+
+                for pc in &cells {
+                    let px = rect.x + pc.col as f32 * cw;
+                    let py = rect.y + pc.row as f32 * ch;
+                    let span = cw * pc.width as f32;
+
+                    inst.push(Inst::solid(px, py, span, ch, to_linear(theme.preedit_bg, 1.0)));
+                    if let Some(gi) = fonts.glyph(pc.c, false) {
+                        inst.push(Inst::glyph(
+                            glyph_rect(&gi, px, py, ascent),
+                            gi.uv,
+                            to_linear(theme.fg, 1.0),
+                        ));
+                    }
+                    // The active segment gets a heavier rule, the rest a thin
+                    // one — the usual way IMEs show what is being converted.
+                    let (h, col) = if pc.active {
+                        (thick, theme.cursor)
+                    } else {
+                        (thin, theme.preedit_underline)
+                    };
+                    inst.push(Inst::solid(px, py + ch - h, span, h, to_linear(col, 1.0)));
+                }
+
+                let (col, row) = preedit_caret(&cells, origin, max_cols);
+                if row < rows {
+                    inst.push(Inst::solid(
+                        rect.x + col as f32 * cw,
+                        rect.y + row as f32 * ch,
+                        thin,
+                        ch,
+                        to_linear(theme.cursor, 1.0),
+                    ));
                 }
             }
 
@@ -674,6 +828,12 @@ impl App {
     }
 }
 
+/// Quad for a glyph drawn with its pen at `(px, py)`, the cell's top-left.
+/// Rounded to whole pixels so stems stay crisp at the atlas's native scale.
+fn glyph_rect(gi: &font::GlyphInfo, px: f32, py: f32, ascent: f32) -> [f32; 4] {
+    [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h]
+}
+
 /// Arrow keys an application should see for `lines` of wheel scrolling on the
 /// alternate screen. Positive scrolls back through the application's own view,
 /// which means Up.
@@ -712,6 +872,119 @@ fn leader_shift(m: ModifiersState) -> Option<bool> {
         return None;
     }
     Some(cmd && m.shift_key())
+}
+
+/// Text the IME is still composing. It belongs to the terminal, not the shell:
+/// nothing is written to the pty until the IME commits it.
+#[derive(Default)]
+struct Preedit {
+    text: String,
+    /// Byte range within `text` that the IME marks as the active segment
+    /// (変換対象). `None` means the IME wants no cursor shown.
+    target: Option<(usize, usize)>,
+    /// Pane the composition belongs to. The OS keeps its marked text when
+    /// focus moves between our panes — it has no idea they exist — so the
+    /// composition has to remember where it started, or a later commit would
+    /// land in whichever pane happens to be focused.
+    ///
+    /// Deliberately outlives an empty `text`: winit sends an empty preedit
+    /// immediately before `Ime::Commit`, and clearing the owner there would
+    /// orphan the commit. So a cancelled composition also leaves a stale owner
+    /// behind — harmless, because only `commit` reads it and the next
+    /// composition rebinds it first.
+    owner: Option<PaneId>,
+}
+
+impl Preedit {
+    fn is_active(&self) -> bool {
+        !self.text.is_empty()
+    }
+
+    /// Applies an `Ime::Preedit` update. A composition that is *starting* binds
+    /// to `focus`; one already in flight keeps its owner — which matters
+    /// because winit sends an empty preedit immediately before `Ime::Commit`,
+    /// and that must not orphan it.
+    fn update(&mut self, text: String, target: Option<(usize, usize)>, focus: PaneId) {
+        if !self.is_active() && !text.is_empty() {
+            self.owner = Some(focus);
+        }
+        self.text = text;
+        self.target = target;
+    }
+
+    /// Consumes the composition, returning the pane the text belongs to.
+    fn commit(&mut self, fallback: PaneId) -> PaneId {
+        let owner = self.owner.take().unwrap_or(fallback);
+        self.text.clear();
+        self.target = None;
+        owner
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.target = None;
+        self.owner = None;
+    }
+}
+
+/// One composed character placed on the grid.
+#[derive(Debug, PartialEq)]
+struct PreeditCell {
+    col: usize,
+    row: usize,
+    c: char,
+    /// Columns occupied — 2 for full-width characters.
+    width: usize,
+    /// Inside the IME's active segment, which is drawn more prominently.
+    active: bool,
+}
+
+/// Places composing text on the grid starting at `start`, wrapping within
+/// `cols` and stopping at `rows`. Full-width characters take two columns and
+/// wrap as a unit rather than being split across the edge.
+fn layout_preedit(
+    text: &str,
+    target: Option<(usize, usize)>,
+    start: (usize, usize),
+    cols: usize,
+    rows: usize,
+) -> Vec<PreeditCell> {
+    let mut out = Vec::new();
+    if cols == 0 || rows == 0 {
+        return out;
+    }
+    let (mut col, mut row) = start;
+    col = col.min(cols.saturating_sub(1));
+
+    for (byte, c) in text.char_indices() {
+        if c == '\n' || c == '\r' {
+            continue;
+        }
+        let width = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+        if col + width > cols {
+            col = 0;
+            row += 1;
+        }
+        if row >= rows {
+            break;
+        }
+        let active = target.is_some_and(|(t0, t1)| byte >= t0 && byte < t1);
+        out.push(PreeditCell { col, row, c, width, active });
+        col += width;
+    }
+    out
+}
+
+/// Where the caret sits after `cells`, for drawing and for telling the IME
+/// where to put its candidate window.
+fn preedit_caret(cells: &[PreeditCell], start: (usize, usize), cols: usize) -> (usize, usize) {
+    match cells.last() {
+        None => start,
+        Some(last) => {
+            let col = last.col + last.width;
+            if col >= cols { (0, last.row + 1) } else { (col, last.row) }
+        }
+    }
 }
 
 /// Adds a sub-line scroll delta to `accum` and takes out whole lines, leaving
@@ -767,6 +1040,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         self.scale = window.scale_factor() as f32;
+        // Without this the OS never routes composition to us and Japanese,
+        // Chinese and Korean input simply cannot be typed. winit leaves IME
+        // off by default.
+        window.set_ime_allowed(true);
 
         let fonts = match FontSet::new(self.font_pt * self.scale) {
             Ok(f) => f,
@@ -838,6 +1115,8 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
 
+            WindowEvent::Ime(ime) => self.handle_ime(ime),
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
@@ -869,7 +1148,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if state == ElementState::Pressed && button == MouseButton::Left {
                     if let Some(id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) {
                         if id != self.focus {
-                            self.focus = id;
+                            self.set_focus(id);
                             self.update_title();
                             self.request_redraw();
                         }
@@ -1051,5 +1330,205 @@ mod tests {
         assert_eq!(out.len(), 32 * 3);
         let out = alternate_scroll_bytes(isize::MIN, false);
         assert_eq!(out.len(), 32 * 3, "the extreme negative must not overflow");
+    }
+
+    /// `(col, row, char)` triples, for readable assertions.
+    fn placed(cells: &[PreeditCell]) -> Vec<(usize, usize, char)> {
+        cells.iter().map(|c| (c.col, c.row, c.c)).collect()
+    }
+
+    #[test]
+    fn composing_text_starts_at_the_caret() {
+        let cells = layout_preedit("abc", None, (5, 2), 80, 24);
+        assert_eq!(placed(&cells), vec![(5, 2, 'a'), (6, 2, 'b'), (7, 2, 'c')]);
+    }
+
+    #[test]
+    fn kana_takes_two_columns_each() {
+        let cells = layout_preedit("にほん", None, (0, 0), 80, 24);
+        assert_eq!(placed(&cells), vec![(0, 0, 'に'), (2, 0, 'ほ'), (4, 0, 'ん')]);
+        assert!(cells.iter().all(|c| c.width == 2));
+    }
+
+    #[test]
+    fn composing_text_wraps_at_the_pane_edge() {
+        let cells = layout_preedit("abcd", None, (2, 0), 4, 24);
+        assert_eq!(placed(&cells), vec![(2, 0, 'a'), (3, 0, 'b'), (0, 1, 'c'), (1, 1, 'd')]);
+    }
+
+    #[test]
+    fn a_wide_char_wraps_whole_rather_than_splitting() {
+        // One column left, but 'あ' needs two — it must move to the next row
+        // intact instead of straddling the edge.
+        let cells = layout_preedit("あ", None, (3, 0), 4, 24);
+        assert_eq!(placed(&cells), vec![(0, 1, 'あ')]);
+    }
+
+    #[test]
+    fn composing_text_stops_at_the_bottom_of_the_pane() {
+        // Two rows only: everything past them is dropped, not drawn off-pane.
+        let cells = layout_preedit("abcdef", None, (0, 0), 2, 2);
+        assert!(cells.iter().all(|c| c.row < 2), "{:?}", placed(&cells));
+        assert_eq!(cells.len(), 4);
+    }
+
+    #[test]
+    fn the_active_segment_is_marked_by_byte_range() {
+        // "にほんご": each kana is 3 bytes. Mark the second one.
+        let text = "にほんご";
+        let cells = layout_preedit(text, Some((3, 6)), (0, 0), 80, 24);
+        let active: Vec<char> = cells.iter().filter(|c| c.active).map(|c| c.c).collect();
+        assert_eq!(active, vec!['ほ']);
+    }
+
+    #[test]
+    fn no_segment_is_active_without_a_range() {
+        let cells = layout_preedit("にほん", None, (0, 0), 80, 24);
+        assert!(cells.iter().all(|c| !c.active));
+    }
+
+    #[test]
+    fn an_empty_target_range_marks_nothing() {
+        // IMEs send a zero-width range to mean "caret here", not "select this".
+        let cells = layout_preedit("abc", Some((1, 1)), (0, 0), 80, 24);
+        assert!(cells.iter().all(|c| !c.active));
+    }
+
+    #[test]
+    fn the_caret_follows_the_composed_text() {
+        let cells = layout_preedit("にほん", None, (1, 0), 80, 24);
+        assert_eq!(preedit_caret(&cells, (1, 0), 80), (7, 0), "1 + three wide chars");
+    }
+
+    #[test]
+    fn the_caret_wraps_when_composing_fills_the_row() {
+        let cells = layout_preedit("abcd", None, (0, 0), 4, 24);
+        assert_eq!(preedit_caret(&cells, (0, 0), 4), (0, 1));
+    }
+
+    #[test]
+    fn an_empty_composition_leaves_the_caret_alone() {
+        let cells = layout_preedit("", None, (7, 3), 80, 24);
+        assert!(cells.is_empty());
+        assert_eq!(preedit_caret(&cells, (7, 3), 80), (7, 3));
+    }
+
+    #[test]
+    fn newlines_in_composing_text_are_ignored() {
+        // Composition is a single run; a stray newline must not break layout.
+        let cells = layout_preedit("a\nb", None, (0, 0), 80, 24);
+        assert_eq!(placed(&cells), vec![(0, 0, 'a'), (1, 0, 'b')]);
+    }
+
+    #[test]
+    fn a_degenerate_pane_produces_no_cells() {
+        assert!(layout_preedit("abc", None, (0, 0), 0, 24).is_empty());
+        assert!(layout_preedit("abc", None, (0, 0), 80, 0).is_empty());
+    }
+
+    #[test]
+    fn preedit_tracks_active_state() {
+        let mut p = Preedit::default();
+        assert!(!p.is_active());
+        p.text = "に".into();
+        p.target = Some((0, 3));
+        assert!(p.is_active());
+        p.clear();
+        assert!(!p.is_active() && p.target.is_none());
+    }
+
+    #[test]
+    fn a_composition_binds_to_the_pane_it_started_in() {
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        assert_eq!(p.owner, Some(7));
+    }
+
+    #[test]
+    fn a_composition_in_flight_keeps_its_owner_when_focus_moves() {
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        // Focus moved to pane 9 mid-composition; the text still belongs to 7.
+        p.update("にほ".into(), None, 9);
+        assert_eq!(p.owner, Some(7));
+    }
+
+    #[test]
+    fn the_empty_preedit_before_a_commit_does_not_orphan_it() {
+        // winit sends Preedit("") immediately before Commit. If that cleared
+        // the owner, the commit would fall back to whatever is focused now —
+        // exactly the misdelivery this is meant to prevent.
+        let mut p = Preedit::default();
+        p.update("にほん".into(), None, 7);
+        p.update(String::new(), None, 9);
+        assert_eq!(p.owner, Some(7));
+        assert_eq!(p.commit(9), 7, "commit must go to the composing pane");
+    }
+
+    #[test]
+    fn commit_consumes_the_composition() {
+        let mut p = Preedit::default();
+        p.update("に".into(), Some((0, 3)), 2);
+        assert_eq!(p.commit(2), 2);
+        assert!(!p.is_active());
+        assert_eq!(p.owner, None);
+        assert_eq!(p.target, None);
+    }
+
+    #[test]
+    fn a_fresh_composition_after_a_commit_binds_to_the_new_focus() {
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        p.commit(7);
+        p.update("あ".into(), None, 9);
+        assert_eq!(p.owner, Some(9));
+    }
+
+    #[test]
+    fn a_composition_started_after_a_cancel_rebinds() {
+        // Escape clears the text without a commit; the stale owner must not
+        // capture the next composition.
+        let mut p = Preedit::default();
+        p.update("に".into(), None, 7);
+        p.update(String::new(), None, 7);
+        p.update("あ".into(), None, 9);
+        assert_eq!(p.owner, Some(9));
+    }
+
+    #[test]
+    fn commit_falls_back_when_nothing_was_composing() {
+        let mut p = Preedit::default();
+        assert_eq!(p.commit(4), 4);
+    }
+
+    #[test]
+    fn clear_drops_the_owner_too() {
+        let mut p = Preedit::default();
+        p.update("に".into(), Some((0, 3)), 3);
+        p.clear();
+        assert!(!p.is_active());
+        assert_eq!(p.owner, None);
+    }
+
+    #[test]
+    fn the_caret_can_land_one_row_past_a_full_pane() {
+        // Why update_ime_area clamps the anchor row: the cells are clipped to
+        // the pane, but the caret that follows them is not, so a composition
+        // that fills the pane puts it on a row that does not exist.
+        let cells = layout_preedit("abcd", None, (0, 0), 2, 2);
+        assert!(cells.iter().all(|c| c.row < 2), "cells are clipped");
+        let (_, row) = preedit_caret(&cells, (0, 0), 2);
+        assert_eq!(row, 2, "one past the last row");
+    }
+
+    #[test]
+    fn clipping_the_layout_bounds_the_anchor() {
+        // Passing the pane's real row count (rather than usize::MAX) is what
+        // keeps the anchor within one row of the pane for any length of text.
+        let rows = 3;
+        let cells = layout_preedit(&"あ".repeat(200), None, (0, 0), 4, rows);
+        assert!(cells.iter().all(|c| c.row < rows));
+        let (_, row) = preedit_caret(&cells, (0, 0), 4);
+        assert!(row <= rows, "anchor row {row} should be at most {rows}");
     }
 }
