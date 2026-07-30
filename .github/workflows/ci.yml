@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only: this job builds and tests, nothing more.
+permissions:
+  contents: read
+
+# A new push supersedes the run it interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # The pty tests carry their own 20s deadlines, but a wedged shell would
+    # otherwise sit on the job's 6-hour default.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than left to whatever the runner image ships: this tree
+      # is edition 2024, so it needs Rust 1.85 or newer.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # 302 packages (wgpu, naga, winit). Without this every run is cold.
+      # Must follow the toolchain step — the cache key includes the rustc
+      # version.
+      - uses: Swatinem/rust-cache@v2
+
+      # The font tests rasterise real glyphs through the system font database:
+      # DejaVu Sans Mono is the monospace face and covers the box-drawing and
+      # arrow characters; Noto Sans CJK JP is what the fallback chain is
+      # tested against.
+      - name: Install fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fonts-dejavu-core fonts-noto-cjk
+
+      # Cheapest check first: no dependency build needed to fail on formatting.
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Tests
+        run: cargo test --locked
