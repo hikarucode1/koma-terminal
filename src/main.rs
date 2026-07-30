@@ -1,6 +1,6 @@
 //! koma — a tiling terminal emulator.
 //!
-//! Panes live in a binary split tree; each leaf owns a pty and a screen grid.
+//! Panes live in an n-ary split tree; each leaf owns a pty and a screen grid.
 //! Everything on screen is drawn as instanced quads through one wgpu pipeline.
 
 mod font;
@@ -94,6 +94,10 @@ struct App {
     cursor_pos: (f32, f32),
     scale: f32,
     font_pt: f32,
+    /// Leftover sub-line scroll from the last wheel event, and the pane it
+    /// belongs to.
+    scroll_accum: f32,
+    wheel_target: PaneId,
     theme: Theme,
     /// Reused frame buffer so we're not allocating a Vec per redraw.
     instances: Vec<Inst>,
@@ -114,6 +118,8 @@ impl App {
             cursor_pos: (0.0, 0.0),
             scale: 1.0,
             font_pt: DEFAULT_FONT_PT,
+            scroll_accum: 0.0,
+            wheel_target: 0,
             theme: Theme::default(),
             instances: Vec::new(),
         }
@@ -237,27 +243,18 @@ impl App {
 
     /// App-level shortcuts. Returns true if the key was consumed.
     fn handle_shortcut(&mut self, key: &Key, event_loop: &ActiveEventLoop) -> bool {
-        // Cmd on macOS; Ctrl+Shift elsewhere. Both are accepted everywhere so
-        // the same muscle memory works when running this on Linux too.
-        let cmd = self.mods.super_key();
-        let ctrl_shift = self.mods.control_key() && self.mods.shift_key();
-
-        if !cmd && !ctrl_shift {
+        let Some(shift) = leader_shift(self.mods) else {
             // Scrollback needs no leader beyond Shift.
             if self.mods.shift_key() {
                 if let Key::Named(n) = key {
-                    let page = self
-                        .panes
-                        .get(&self.focus)
-                        .map(|p| p.grid.rows.saturating_sub(1))
-                        .unwrap_or(10) as isize;
+                    let page = self.page_lines();
                     match n {
                         NamedKey::PageUp => {
-                            self.scroll(page);
+                            self.scroll_focused(page);
                             return true;
                         }
                         NamedKey::PageDown => {
-                            self.scroll(-page);
+                            self.scroll_focused(-page);
                             return true;
                         }
                         _ => {}
@@ -265,13 +262,48 @@ impl App {
                 }
             }
             return false;
-        }
+        };
 
         let alt = self.mods.alt_key();
-        // With the leader held, Shift picks the other split direction.
-        let shift = self.mods.shift_key();
 
         if let Key::Named(n) = key {
+            // Scrollback. Mac keyboards have no PageUp, so Cmd+Shift+Arrow is
+            // the binding that actually gets used there. Linux keeps
+            // Ctrl+Shift+Arrow for resizing and scrolls with Shift+PageUp.
+            if shift && !alt {
+                match n {
+                    NamedKey::ArrowUp => {
+                        self.scroll_focused(1);
+                        return true;
+                    }
+                    NamedKey::ArrowDown => {
+                        self.scroll_focused(-1);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            match n {
+                NamedKey::PageUp => {
+                    let page = self.page_lines();
+                    self.scroll_focused(page);
+                    return true;
+                }
+                NamedKey::PageDown => {
+                    let page = self.page_lines();
+                    self.scroll_focused(-page);
+                    return true;
+                }
+                NamedKey::Home => {
+                    self.scroll_to_edge(true);
+                    return true;
+                }
+                NamedKey::End => {
+                    self.scroll_to_edge(false);
+                    return true;
+                }
+                _ => {}
+            }
             match n {
                 NamedKey::ArrowLeft if alt => {
                     self.focus_direction(-1.0, 0.0);
@@ -316,8 +348,15 @@ impl App {
         let Key::Character(s) = key else { return false };
         // Lowercase so Cmd+Shift+D and Cmd+D land in the same arm.
         match s.to_lowercase().as_str() {
+            // Cmd+D / Cmd+Shift+D on macOS. Under the Ctrl+Shift leader the
+            // shifted variant is unreachable, so E is the second split key —
+            // it works under either leader.
             "d" => {
                 self.split_focused(if shift { Axis::Vertical } else { Axis::Horizontal });
+                true
+            }
+            "e" => {
+                self.split_focused(Axis::Vertical);
                 true
             }
             "w" => {
@@ -362,15 +401,66 @@ impl App {
         self.focus = leaves[(cur + step).rem_euclid(n) as usize];
     }
 
-    fn scroll(&mut self, lines: isize) {
-        let Some(p) = self.panes.get_mut(&self.focus) else { return };
-        // The alternate screen (vim, less) scrolls itself; don't fight it.
-        if p.grid.alt_active {
+    /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
+    /// back through history.
+    ///
+    /// A no-op on the alternate screen: a full-screen application owns the
+    /// whole viewport and we keep no scrollback for it, so there is nothing to
+    /// move. Wheel input gets special treatment — see `wheel_scroll`.
+    fn scroll_pane(&mut self, id: PaneId, lines: isize) {
+        let Some(p) = self.panes.get_mut(&id) else { return };
+        if lines == 0 || p.grid.alt_active {
             return;
         }
         let max = p.grid.scrollback.len() as isize;
         let next = p.grid.view_offset as isize + lines;
         p.grid.view_offset = next.clamp(0, max) as usize;
+    }
+
+    /// Scrolling from the wheel or trackpad. On the alternate screen this turns
+    /// into arrow keys for the application — xterm calls it alternate scroll.
+    ///
+    /// Deliberately wheel-only. Routing the keyboard's scrollback keys through
+    /// here too would make `Shift+PageUp` move an application's *cursor*
+    /// instead of its view, and a page's worth of arrows is not a page anyway.
+    ///
+    /// Unconditional only because no mouse reporting exists yet (no DECSET
+    /// 1000/1002/1003/1006 in grid.rs). When that lands, an application with
+    /// tracking enabled must receive mouse sequences instead, and xterm
+    /// additionally gates the arrow-key fallback on DECSET 1007.
+    fn wheel_scroll(&mut self, id: PaneId, lines: isize) {
+        if lines == 0 {
+            return;
+        }
+        let alt = self.panes.get(&id).is_some_and(|p| p.grid.alt_active);
+        if !alt {
+            self.scroll_pane(id, lines);
+            return;
+        }
+        let Some(p) = self.panes.get_mut(&id) else { return };
+        let bytes = alternate_scroll_bytes(lines, p.grid.app_cursor_keys);
+        p.pty.write(&bytes);
+    }
+
+    fn scroll_focused(&mut self, lines: isize) {
+        self.scroll_pane(self.focus, lines);
+    }
+
+    /// Jumps to the oldest retained line, or back to the live screen.
+    fn scroll_to_edge(&mut self, top: bool) {
+        let Some(p) = self.panes.get_mut(&self.focus) else { return };
+        if p.grid.alt_active {
+            return;
+        }
+        p.grid.view_offset = if top { p.grid.scrollback.len() } else { 0 };
+    }
+
+    fn page_lines(&self) -> isize {
+        self.panes
+            .get(&self.focus)
+            .map(|p| p.grid.rows.saturating_sub(1))
+            .unwrap_or(10)
+            .max(1) as isize
     }
 
     fn pane_at(&self, px: f32, py: f32) -> Option<PaneId> {
@@ -584,6 +674,60 @@ impl App {
     }
 }
 
+/// Arrow keys an application should see for `lines` of wheel scrolling on the
+/// alternate screen. Positive scrolls back through the application's own view,
+/// which means Up.
+///
+/// Capped, because one gesture must not be able to inject an unbounded burst of
+/// keystrokes. A single wheel event never legitimately exceeds this.
+fn alternate_scroll_bytes(lines: isize, app_cursor_keys: bool) -> Vec<u8> {
+    const MAX_KEYS: usize = 32;
+    let seq: &[u8] = match (lines > 0, app_cursor_keys) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    let count = lines.unsigned_abs().min(MAX_KEYS);
+    let mut out = Vec::with_capacity(count * seq.len());
+    for _ in 0..count {
+        out.extend_from_slice(seq);
+    }
+    out
+}
+
+/// Resolves modifiers into "is a shortcut leader held, and is Shift an *extra*
+/// modifier on top of it".
+///
+/// The leader is Cmd on macOS and Ctrl+Shift elsewhere, and both are accepted
+/// on both platforms. That makes Shift ambiguous: under Ctrl+Shift it is part
+/// of the leader, so treating it as a modifier would make every Ctrl+Shift
+/// binding behave like its shifted variant.
+///
+/// Returns `None` when no leader is held.
+fn leader_shift(m: ModifiersState) -> Option<bool> {
+    let cmd = m.super_key();
+    let ctrl_shift = m.control_key() && m.shift_key();
+    if !cmd && !ctrl_shift {
+        return None;
+    }
+    Some(cmd && m.shift_key())
+}
+
+/// Adds a sub-line scroll delta to `accum` and takes out whole lines, leaving
+/// the remainder behind. A trackpad sends a few pixels per event — far less
+/// than one row — so without carrying the remainder every scroll would round
+/// to zero and nothing would move.
+fn take_whole_lines(accum: &mut f32, delta: f32) -> isize {
+    if !delta.is_finite() {
+        return 0;
+    }
+    *accum += delta;
+    let whole = accum.trunc();
+    *accum -= whole;
+    whole as isize
+}
+
 /// True when cell `x` is the left half of a double-width character.
 fn is_wide(row: &[Cell], x: usize) -> bool {
     row.get(x + 1).is_some_and(|n| n.flags & FLAG_WIDE_SPACER != 0)
@@ -735,6 +879,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let (_, ch) = self.cell_size();
+                // Positive means "reveal content above", i.e. go back in history.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y * 3.0,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / ch,
@@ -742,10 +887,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // Scroll whatever is under the pointer, not just the focused pane.
                 let target =
                     self.pane_at(self.cursor_pos.0, self.cursor_pos.1).unwrap_or(self.focus);
-                let saved = std::mem::replace(&mut self.focus, target);
-                self.scroll(lines.round() as isize);
-                self.focus = saved;
-                self.request_redraw();
+                if target != self.wheel_target {
+                    self.wheel_target = target;
+                    self.scroll_accum = 0.0;
+                }
+                // A trackpad reports a few pixels per event — well under one
+                // row — so the remainder has to carry over between events or
+                // every scroll rounds away to nothing.
+                let whole = take_whole_lines(&mut self.scroll_accum, lines);
+                if whole != 0 {
+                    self.wheel_scroll(target, whole);
+                    self.request_redraw();
+                }
             }
 
             WindowEvent::RedrawRequested => self.redraw(),
@@ -764,4 +917,139 @@ fn main() -> Result<()> {
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_trackpad_deltas_accumulate_into_a_scroll() {
+        // A gentle two-finger swipe: ~4px per event against a ~30px row. Each
+        // one alone is a fraction of a line, so they must add up.
+        let mut accum = 0.0;
+        let per_event = 4.0 / 30.0;
+        let mut moved = 0;
+        for _ in 0..8 {
+            moved += take_whole_lines(&mut accum, per_event);
+        }
+        assert!(moved > 0, "eight small deltas scrolled {moved} lines");
+    }
+
+    #[test]
+    fn a_single_small_delta_scrolls_nothing_yet() {
+        let mut accum = 0.0;
+        assert_eq!(take_whole_lines(&mut accum, 0.3), 0);
+        assert!(accum > 0.0, "the remainder must be kept, not discarded");
+    }
+
+    #[test]
+    fn no_scroll_is_lost_to_rounding() {
+        // Whatever comes in must eventually come out; nothing evaporates.
+        let mut accum = 0.0;
+        let total: f32 = 100.0;
+        let mut moved = 0;
+        for _ in 0..1000 {
+            moved += take_whole_lines(&mut accum, total / 1000.0);
+        }
+        assert!((moved as f32 - total).abs() <= 1.0, "moved {moved} of {total}");
+    }
+
+    #[test]
+    fn direction_is_preserved_across_the_fraction_boundary() {
+        let mut accum = 0.0;
+        assert_eq!(take_whole_lines(&mut accum, -0.6), 0);
+        assert_eq!(take_whole_lines(&mut accum, -0.6), -1);
+    }
+
+    #[test]
+    fn reversing_direction_cancels_the_pending_remainder() {
+        let mut accum = 0.0;
+        take_whole_lines(&mut accum, 0.7);
+        assert_eq!(take_whole_lines(&mut accum, -0.7), 0);
+        assert!(accum.abs() < 0.01, "accum drifted to {accum}");
+    }
+
+    #[test]
+    fn a_mouse_wheel_click_scrolls_immediately() {
+        // LineDelta devices send whole lines; they must not be delayed.
+        let mut accum = 0.0;
+        assert_eq!(take_whole_lines(&mut accum, 3.0), 3);
+    }
+
+    #[test]
+    fn non_finite_deltas_are_ignored() {
+        let mut accum = 0.5;
+        assert_eq!(take_whole_lines(&mut accum, f32::NAN), 0);
+        assert_eq!(accum, 0.5, "a bad delta must not poison the accumulator");
+    }
+
+    const CMD: ModifiersState = ModifiersState::SUPER;
+    const CTRL: ModifiersState = ModifiersState::CONTROL;
+    const SHIFT: ModifiersState = ModifiersState::SHIFT;
+    const ALT: ModifiersState = ModifiersState::ALT;
+
+    #[test]
+    fn cmd_alone_is_a_leader_without_extra_shift() {
+        assert_eq!(leader_shift(CMD), Some(false));
+    }
+
+    #[test]
+    fn cmd_plus_shift_reports_shift_as_extra() {
+        assert_eq!(leader_shift(CMD | SHIFT), Some(true));
+    }
+
+    #[test]
+    fn ctrl_shift_is_a_leader_and_its_shift_is_not_extra() {
+        // Regression: reported in review. Counting the leader's own Shift as a
+        // modifier made Ctrl+Shift+Up scroll instead of resize on Linux, and
+        // made every split Vertical because the "shifted" branch always won.
+        assert_eq!(leader_shift(CTRL | SHIFT), Some(false));
+        assert_eq!(leader_shift(CTRL | SHIFT | ALT), Some(false));
+    }
+
+    #[test]
+    fn partial_modifiers_are_not_leaders() {
+        assert_eq!(leader_shift(ModifiersState::empty()), None);
+        assert_eq!(leader_shift(SHIFT), None, "Shift alone belongs to the shell");
+        assert_eq!(leader_shift(CTRL), None, "bare Ctrl must reach the shell as ^C etc.");
+        assert_eq!(leader_shift(ALT), None);
+    }
+
+    #[test]
+    fn cmd_wins_when_both_leaders_are_held() {
+        // Cmd+Shift+Ctrl should still count Shift as extra, since Cmd leads.
+        assert_eq!(leader_shift(CMD | CTRL | SHIFT), Some(true));
+    }
+
+    #[test]
+    fn alternate_scroll_sends_up_for_history_and_down_for_forward() {
+        assert_eq!(alternate_scroll_bytes(1, false), b"\x1b[A".to_vec());
+        assert_eq!(alternate_scroll_bytes(-1, false), b"\x1b[B".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_uses_application_cursor_keys_when_set() {
+        assert_eq!(alternate_scroll_bytes(1, true), b"\x1bOA".to_vec());
+        assert_eq!(alternate_scroll_bytes(-1, true), b"\x1bOB".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_repeats_once_per_line() {
+        assert_eq!(alternate_scroll_bytes(3, false), b"\x1b[A\x1b[A\x1b[A".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_sends_nothing_for_no_movement() {
+        assert!(alternate_scroll_bytes(0, false).is_empty());
+    }
+
+    #[test]
+    fn alternate_scroll_is_capped() {
+        // One gesture must not be able to inject an unbounded keystroke burst.
+        let out = alternate_scroll_bytes(10_000, false);
+        assert_eq!(out.len(), 32 * 3);
+        let out = alternate_scroll_bytes(isize::MIN, false);
+        assert_eq!(out.len(), 32 * 3, "the extreme negative must not overflow");
+    }
 }

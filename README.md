@@ -1,8 +1,9 @@
 # koma
 
 A tiling terminal emulator. Panes split a single window so several shells are
-visible at once; each pane owns its own pty and screen. Rendering is a custom
-GPU renderer on wgpu (Metal on macOS, Vulkan on Linux).
+visible at once; each pane owns its own pty and screen. Splitting the same row
+again keeps every pane the same size (1/N each, not 50/25/25). Rendering is a
+custom GPU renderer on wgpu (Metal on macOS, Vulkan on Linux).
 
 ## Running
 
@@ -21,15 +22,32 @@ both platforms, so the same muscle memory works over ssh.
 | Key | Action |
 | --- | --- |
 | `Cmd+D` | Split left/right |
-| `Cmd+Shift+D` | Split top/bottom |
+| `Cmd+Shift+D` / `Cmd+E` | Split top/bottom |
 | `Cmd+W` | Close the focused pane (closing the last one quits) |
 | `Cmd+Alt+Arrow` | Move focus in that direction |
 | `Cmd+[` / `Cmd+]` | Cycle focus |
 | `Cmd+Arrow` | Resize the focused pane's split |
 | `Cmd+` `+` / `-` / `0` | Font size up / down / reset |
-| `Shift+PageUp` / `PageDown` | Scroll back |
-| Mouse wheel | Scroll the pane under the pointer |
+| `Cmd+Shift+Up` / `Down` | Scroll back one line |
+| `Shift+PageUp` / `PageDown` | Scroll back one page |
+| `Cmd+Home` / `End` | Jump to the oldest line / back to the prompt |
+| Mouse wheel, trackpad | Scroll the pane under the pointer |
 | Left click | Focus a pane |
+
+Mac keyboards have no PageUp, so `Cmd+Shift+Up`/`Down` is the binding that
+actually gets used there. They have no Home/End either — `Cmd+Home`/`End` is
+typed as `Cmd+fn+Left`/`Right`.
+
+Under the `Ctrl+Shift` leader, Shift is part of the leader itself and can't also
+select a variant. So on Linux the second split is `Ctrl+Shift+E`, and
+`Ctrl+Shift+Up`/`Down` resizes rather than scrolls — scroll with
+`Shift+PageUp`/`PageDown`, which Linux keyboards actually have.
+
+In a full-screen app (vim, less, man) the application owns the whole viewport and
+we keep no scrollback for it. **Wheel** scrolling is translated into arrow keys
+so the application scrolls itself — xterm calls this alternate scroll. The
+keyboard scrollback keys do nothing there, deliberately: sending a page of
+arrows would move the application's cursor rather than its view.
 
 Everything else is encoded and forwarded to the shell.
 
@@ -37,7 +55,7 @@ Everything else is encoded and forwarded to the shell.
 
 ```
 main.rs    winit event loop, pane bookkeeping, frame building
- ├ pane.rs  binary split tree -> pane rects (the tiling)
+ ├ pane.rs  n-ary split tree -> pane rects (the tiling)
  ├ pty.rs   spawns $SHELL on a pty; a reader thread wakes the event loop
  ├ grid.rs  cell grid + scrollback + the vte::Perform that mutates it
  ├ font.rs  font lookup (fontdb), rasterising (swash), shelf-packed atlas
@@ -64,11 +82,13 @@ coverage.
 cargo test
 ```
 
-46 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
+73 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
 including truecolor, alt screen, wide characters, DSR replies), the split tree
-(layout, non-overlap, collapse-on-close, directional focus), font rasterisation
-and the atlas, and real pty behaviour (a shell's output round-tripping, `stty
-size` seeing the right dimensions, EOF on exit).
+(even sizing across repeated splits and across a close-induced collapse,
+non-overlap, directional focus), leader/modifier resolution, sub-line scroll
+accumulation, alternate-scroll encoding, font rasterisation and the atlas, and real
+pty behaviour (a shell's output round-tripping, `stty size` seeing the right
+dimensions, EOF on exit).
 
 The GPU path itself is not covered by tests — it needs a display.
 
@@ -78,6 +98,7 @@ The GPU path itself is not covered by tests — it needs a display.
   coordinates plus `Cmd+C`/`Cmd+V`.
 - **Reflow on resize.** Lines are truncated rather than re-wrapped when the
   window narrows.
+- **A scrollbar**, or any indicator of where you are in the scrollback.
 - **Mouse reporting to the shell**, so vim/tmux can see clicks.
 - **Ligatures / italic face.** Italic currently renders with the regular face.
 - **Config file.** The theme and font size are compiled in (`theme.rs`,
