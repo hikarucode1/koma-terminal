@@ -199,8 +199,8 @@ impl App {
             Ok(new_id) => {
                 if self.tree.split(self.focus, axis, new_id) {
                     self.focus = new_id;
+                    // relayout() refreshes the IME anchor on its way out.
                     self.relayout();
-                    self.update_ime_area();
                 } else {
                     // Focus wasn't in the tree; drop the pane we just made.
                     if let Some(mut p) = self.panes.remove(&new_id) {
@@ -529,9 +529,15 @@ impl App {
                 // Composing is input, so leave the scrollback the way typing
                 // does. Otherwise the preedit would be drawn at the live
                 // cursor's coordinates, on top of history.
-                let id = self.composing_pane();
-                if let Some(p) = self.panes.get_mut(&id) {
-                    p.grid.view_offset = 0;
+                //
+                // Only for a real composition: an empty preedit also arrives
+                // when the IME is dismissed or the input source changes, and
+                // yanking the view back then would look unprovoked.
+                if self.preedit.is_active() {
+                    let id = self.composing_pane();
+                    if let Some(p) = self.panes.get_mut(&id) {
+                        p.grid.view_offset = 0;
+                    }
                 }
                 self.update_ime_area();
                 self.request_redraw();
@@ -673,7 +679,7 @@ impl App {
                         let bold = cell.flags & FLAG_BOLD != 0;
                         if let Some(gi) = fonts.glyph(cell.c, bold) {
                             inst.push(Inst::glyph(
-                                [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h],
+                                glyph_rect(&gi, px, py, ascent),
                                 gi.uv,
                                 to_linear(fg, 1.0),
                             ));
@@ -696,8 +702,12 @@ impl App {
             let composing = self.preedit.is_active() && self.preedit.owner == Some(*id);
 
             // Cursor, live screen only.
-            if !composing && g.cursor_visible && g.view_offset == 0 && g.cy < rows && g.cx < max_cols
-            {
+            let show_cursor = !composing
+                && g.cursor_visible
+                && g.view_offset == 0
+                && g.cy < rows
+                && g.cx < max_cols;
+            if show_cursor {
                 let px = rect.x + g.cx as f32 * cw;
                 let py = rect.y + g.cy as f32 * ch;
                 let thickness = (2.0 * scale).max(1.0);
@@ -717,12 +727,7 @@ impl App {
                             let bold = cell.flags & FLAG_BOLD != 0;
                             if let Some(gi) = fonts.glyph(cell.c, bold) {
                                 inst.push(Inst::glyph(
-                                    [
-                                        (px + gi.left).round(),
-                                        (py + ascent - gi.top).round(),
-                                        gi.w,
-                                        gi.h,
-                                    ],
+                                    glyph_rect(&gi, px, py, ascent),
                                     gi.uv,
                                     to_linear(theme.bg, 1.0),
                                 ));
@@ -749,7 +754,7 @@ impl App {
                     inst.push(Inst::solid(px, py, span, ch, to_linear(theme.preedit_bg, 1.0)));
                     if let Some(gi) = fonts.glyph(pc.c, false) {
                         inst.push(Inst::glyph(
-                            [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h],
+                            glyph_rect(&gi, px, py, ascent),
                             gi.uv,
                             to_linear(theme.fg, 1.0),
                         ));
@@ -821,6 +826,12 @@ impl App {
             .unwrap_or("koma");
         w.set_title(t);
     }
+}
+
+/// Quad for a glyph drawn with its pen at `(px, py)`, the cell's top-left.
+/// Rounded to whole pixels so stems stay crisp at the atlas's native scale.
+fn glyph_rect(gi: &font::GlyphInfo, px: f32, py: f32, ascent: f32) -> [f32; 4] {
+    [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h]
 }
 
 /// Arrow keys an application should see for `lines` of wheel scrolling on the
