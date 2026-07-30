@@ -2,12 +2,41 @@
 //! channel, waking the winit event loop whenever bytes arrive.
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+/// Shells to try, in order, when `$SHELL` isn't usable. zsh leads because it is
+/// the macOS default; the last is guaranteed by POSIX.
+const SHELL_CANDIDATES: [&str; 3] = ["/bin/zsh", "/bin/bash", "/bin/sh"];
+
+/// Picks the shell to run. `$SHELL` wins when it is set and non-empty;
+/// otherwise the first candidate that actually exists on this system.
+///
+/// The previous code fell back to `/bin/zsh` unconditionally, which meant koma
+/// refused to start at all on a Linux box with no zsh and no `$SHELL` — a
+/// container or a bare service session, for instance.
+fn resolve_shell(env_shell: Option<String>) -> String {
+    if let Some(s) = env_shell {
+        if !s.trim().is_empty() {
+            return s;
+        }
+    }
+    SHELL_CANDIDATES
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|p| p.to_string())
+        // Nothing found: hand the OS the POSIX path and let spawn report why.
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+fn default_shell() -> String {
+    resolve_shell(std::env::var("SHELL").ok())
+}
 
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
@@ -30,7 +59,7 @@ impl Pty {
         let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
         let pair = native_pty_system().openpty(size)?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell = default_shell();
         let mut cmd = CommandBuilder::new(&shell);
         // Login shell, so the user's normal profile applies.
         cmd.arg("-l");
@@ -189,5 +218,54 @@ mod tests {
         }
         pty.kill();
         assert!(hits.load(Ordering::Acquire) > 0, "the wake callback never fired");
+    }
+
+    #[test]
+    fn an_explicit_shell_wins() {
+        assert_eq!(resolve_shell(Some("/usr/bin/fish".into())), "/usr/bin/fish");
+    }
+
+    #[test]
+    fn an_unset_shell_falls_back_to_something_that_exists() {
+        // The old code hard-coded /bin/zsh here, so koma refused to start on any
+        // machine without zsh — which is most Linux boxes, and every CI runner.
+        let shell = resolve_shell(None);
+        assert!(Path::new(&shell).exists(), "picked {shell:?}, which does not exist");
+    }
+
+    #[test]
+    fn a_blank_shell_is_treated_as_unset() {
+        for blank in ["", "   "] {
+            let shell = resolve_shell(Some(blank.into()));
+            assert!(Path::new(&shell).exists(), "{blank:?} -> {shell:?}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_order_prefers_zsh_then_bash() {
+        // Order matters: zsh is the macOS default, so a Mac with $SHELL somehow
+        // unset should still land on the shell its user actually has.
+        assert_eq!(SHELL_CANDIDATES, ["/bin/zsh", "/bin/bash", "/bin/sh"]);
+    }
+
+    #[test]
+    fn a_pty_starts_with_no_shell_in_the_environment() {
+        // The regression itself: this used to fail with ENOENT on /bin/zsh.
+        let shell = resolve_shell(None);
+        let mut pty =
+            Pty::spawn(80, 24, || {}).unwrap_or_else(|e| panic!("could not start {shell:?}: {e}"));
+        pty.write(b"echo KOMA-OK\n");
+        let mut out = String::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) && !out.contains("KOMA-OK") {
+            let chunk = pty.read_available();
+            if chunk.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            out.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        pty.kill();
+        assert!(out.contains("KOMA-OK"), "{shell:?} produced: {out:?}");
     }
 }
