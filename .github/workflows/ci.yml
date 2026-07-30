@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+
+      # The font tests rasterise real glyphs through the system font database:
+      # a monospace face, plus CJK and symbol coverage for the fallback chain.
+      - name: Install fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fonts-dejavu-core fonts-noto-cjk
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Tests
+        run: cargo test --locked
