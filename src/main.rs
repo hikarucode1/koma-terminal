@@ -1020,6 +1020,21 @@ fn glyph_rect(gi: &font::GlyphInfo, px: f32, py: f32, ascent: f32) -> [f32; 4] {
     [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h]
 }
 
+/// Removes every occurrence of `marker`, including any that removal itself
+/// splices together.
+///
+/// A single pass is not enough: `ESC[20` + `ESC[201~` + `1~` becomes `ESC[201~`
+/// once the inner marker is taken out. Nothing reaches this with an ESC intact
+/// today, but the guarantee belongs with the marker rather than depending on a
+/// filter three branches away — which is the whole reason this is a function
+/// with its own tests.
+fn strip_end_markers(mut s: String, marker: &str) -> String {
+    while s.contains(marker) {
+        s = s.replace(marker, "");
+    }
+    s
+}
+
 /// Encodes clipboard text for the pty.
 ///
 /// With bracketed paste on (DECSET 2004) the text is wrapped in markers, so the
@@ -1037,8 +1052,8 @@ fn glyph_rect(gi: &font::GlyphInfo, px: f32, py: f32, ascent: f32) -> [f32; 4] {
 /// - The end marker is stripped from the payload. Pasting text that contains
 ///   it would otherwise end bracketed mode early and let the remainder run as
 ///   commands — the standard injection against this feature.
-/// - C0 controls other than tab and newline are dropped, so a stray ESC in the
-///   clipboard can't start an escape sequence.
+/// - C0 and C1 controls other than tab and newline are dropped, so a stray ESC
+///   — or a bare CSI at U+009B — can't start an escape sequence.
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     const START: &str = "\x1b[200~";
     const END: &str = "\x1b[201~";
@@ -1055,13 +1070,13 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
                 clean.push('\n');
             }
             '\n' | '\t' => clean.push(c),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {}
+            // C0, DEL, and C1 — the last of which includes a standalone CSI at
+            // U+009B, so dropping ESC alone would not be consistent.
+            c if (c as u32) < 0x20 || c as u32 == 0x7f || (0x80..=0x9f).contains(&(c as u32)) => {}
             c => clean.push(c),
         }
     }
-    // Only reachable if ESC survived above; it doesn't, but the guarantee
-    // belongs next to the marker rather than three branches away.
-    let clean = clean.replace(END, "");
+    let clean = strip_end_markers(clean, END);
 
     if bracketed { format!("{START}{clean}{END}").into_bytes() } else { clean.into_bytes() }
 }
@@ -1816,6 +1831,8 @@ mod tests {
         assert_eq!(wheel_action(true, true), WheelAction::Viewport);
     }
 
+    const END: &str = "\x1b[201~";
+
     fn pasted(text: &str, bracketed: bool) -> String {
         String::from_utf8(paste_bytes(text, bracketed)).unwrap()
     }
@@ -1886,5 +1903,44 @@ mod tests {
     fn empty_text_still_produces_well_formed_markers() {
         assert_eq!(pasted("", true), "\x1b[200~\x1b[201~");
         assert_eq!(pasted("", false), "");
+    }
+
+    #[test]
+    fn removing_the_end_marker_cannot_splice_a_new_one() {
+        // Removing the inner marker joins "ESC[20" to "1~" and makes another,
+        // so one pass leaves the payload able to close bracketed mode early.
+        let hostile = "\x1b[20\x1b[201~1~rm -rf /".to_string();
+        assert!(
+            hostile.replace(END, "").contains(END),
+            "the premise: a single pass must be insufficient here"
+        );
+        assert!(!strip_end_markers(hostile, END).contains(END));
+    }
+
+    #[test]
+    fn stripping_markers_leaves_ordinary_text_alone() {
+        assert_eq!(strip_end_markers("ls -la".into(), END), "ls -la");
+        assert_eq!(strip_end_markers(String::new(), END), "");
+    }
+
+    #[test]
+    fn an_end_marker_never_survives_a_paste() {
+        // The property, through the real encoder: whatever the clipboard held,
+        // exactly one terminator comes out and it is ours.
+        for hostile in
+            ["safe\x1b[201~rm -rf /\n", "\x1b[20\x1b[201~1~rm -rf /", "\x1b[201~\x1b[201~\x1b[201~"]
+        {
+            let out = pasted(hostile, true);
+            assert_eq!(out.matches(END).count(), 1, "{hostile:?} produced {out:?}");
+            assert!(out.ends_with(END));
+        }
+    }
+
+    #[test]
+    fn c1_controls_are_dropped_too() {
+        // U+009B is CSI on its own; dropping ESC but not this would be an odd
+        // place to stop.
+        let out = pasted("a\u{9b}0;pwned\u{7}b", false);
+        assert_eq!(out, "a0;pwnedb");
     }
 }

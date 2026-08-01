@@ -104,12 +104,13 @@ coverage.
 cargo test
 ```
 
-143 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+151 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
 multibyte text, columns after a double-width character, drag direction,
 extraction and padding), paste encoding (bracketed markers, CRLF, defusing
-escape sequences and an embedded end marker), the split tree
+escape sequences, and an end marker that a single removal pass would splice
+back together), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
 accumulation, alternate-scroll encoding, IME composition layout (wrapping, kana
