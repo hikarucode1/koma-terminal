@@ -85,6 +85,9 @@ pub struct Grid {
     pub bell: bool,
     /// Application cursor keys (DECCKM) — changes what arrow keys send.
     pub app_cursor_keys: bool,
+    /// Bracketed paste (DECSET 2004). When the program asks for it, pasted
+    /// text is wrapped in markers so it can tell a paste from typing.
+    pub bracketed_paste: bool,
     /// Alternate screen buffer, saved main screen while active.
     alt: Option<(Vec<Cell>, usize, usize)>,
     pub alt_active: bool,
@@ -116,6 +119,7 @@ impl Grid {
             title: String::new(),
             bell: false,
             app_cursor_keys: false,
+            bracketed_paste: false,
             alt: None,
             alt_active: false,
         }
@@ -326,6 +330,7 @@ impl Grid {
             match (private, p) {
                 (true, 1) => self.app_cursor_keys = enable,
                 (true, 25) => self.cursor_visible = enable,
+                (true, 2004) => self.bracketed_paste = enable,
                 (true, 1049) | (true, 1047) | (true, 47) => self.set_alt_screen(enable),
                 _ => {}
             }
@@ -973,5 +978,12 @@ mod tests {
         let last = g.abs_row(1);
         assert!(g.row_at(last).is_some());
         assert!(g.row_at(last + 1).is_none());
+    }
+
+    #[test]
+    fn decset_2004_toggles_bracketed_paste() {
+        assert!(!Grid::new(10, 3).bracketed_paste, "off until the program asks");
+        assert!(feed(10, 3, &["\x1b[?2004h"]).bracketed_paste);
+        assert!(!feed(10, 3, &["\x1b[?2004h\x1b[?2004l"]).bracketed_paste);
     }
 }
