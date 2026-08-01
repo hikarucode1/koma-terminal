@@ -32,6 +32,7 @@ on both platforms, so the same muscle memory works over ssh.
 | `Shift+PageUp` / `PageDown` | Scroll back one page |
 | `Cmd+Home` / `End` | Jump to the oldest line / back to the prompt |
 | Mouse wheel, trackpad | Scroll the pane under the pointer |
+| `Shift` + wheel | Scroll our own scrollback, bypassing the program |
 | Left click | Focus a pane |
 
 Mac keyboards have no PageUp, so `Cmd+Shift+Up`/`Down` is the binding that
@@ -46,8 +47,11 @@ select a variant. So on Linux the second split is `Ctrl+Shift+E`, and
 In a full-screen app (vim, less, man) the application owns the whole viewport
 and we keep no scrollback for it. **Wheel** scrolling is translated into arrow
 keys so the application scrolls itself — xterm calls this alternate scroll.
-The keyboard scrollback keys do nothing there, deliberately: sending a page
-of arrows would move the application's cursor rather than its view.
+
+**Hold Shift to take the wheel back.** Shift+wheel always drives koma's own
+viewport and never the program, which is what you want inside tmux: there the
+arrow keys reach a shell's line editor and get read as history navigation
+rather than scrolling.
 
 Everything else is encoded and forwarded to the shell.
 
@@ -96,8 +100,9 @@ coverage.
 cargo test
 ```
 
-97 tests cover the VT parser and grid (wrapping, scroll regions, scrollback, SGR
-including truecolor, alt screen, wide characters, DSR replies), the split tree
+113 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+anchoring, SGR including truecolor, alt screen, wide characters, DSR
+replies), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
 accumulation, alternate-scroll encoding, IME composition layout (wrapping, kana

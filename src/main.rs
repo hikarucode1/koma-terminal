@@ -71,8 +71,6 @@ impl PaneState {
         if bytes.is_empty() {
             return (false, Vec::new());
         }
-        // New output cancels scrollback, matching every other terminal.
-        self.grid.view_offset = 0;
         let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };
         self.parser.advance(&mut perf, &bytes);
         let reply = std::mem::take(&mut perf.reply);
@@ -429,7 +427,7 @@ impl App {
     /// move. Wheel input gets special treatment — see `wheel_scroll`.
     fn scroll_pane(&mut self, id: PaneId, lines: isize) {
         let Some(p) = self.panes.get_mut(&id) else { return };
-        if lines == 0 || p.grid.alt_active {
+        if lines == 0 {
             return;
         }
         let max = p.grid.scrollback.len() as isize;
@@ -448,12 +446,12 @@ impl App {
     /// 1000/1002/1003/1006 in grid.rs). When that lands, an application with
     /// tracking enabled must receive mouse sequences instead, and xterm
     /// additionally gates the arrow-key fallback on DECSET 1007.
-    fn wheel_scroll(&mut self, id: PaneId, lines: isize) {
+    fn wheel_scroll(&mut self, id: PaneId, lines: isize, shift: bool) {
         if lines == 0 {
             return;
         }
         let alt = self.panes.get(&id).is_some_and(|p| p.grid.alt_active);
-        if !alt {
+        if wheel_action(shift, alt) == WheelAction::Viewport {
             self.scroll_pane(id, lines);
             return;
         }
@@ -469,9 +467,6 @@ impl App {
     /// Jumps to the oldest retained line, or back to the live screen.
     fn scroll_to_edge(&mut self, top: bool) {
         let Some(p) = self.panes.get_mut(&self.focus) else { return };
-        if p.grid.alt_active {
-            return;
-        }
         p.grid.view_offset = if top { p.grid.scrollback.len() } else { 0 };
     }
 
@@ -830,6 +825,23 @@ fn glyph_rect(gi: &font::GlyphInfo, px: f32, py: f32, ascent: f32) -> [f32; 4] {
     [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h]
 }
 
+/// Where a wheel event should go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WheelAction {
+    /// Move our own viewport through the scrollback.
+    Viewport,
+    /// Hand it to the program as arrow keys (xterm's alternate scroll).
+    Application,
+}
+
+/// Shift is the standard escape hatch: it always drives our viewport and never
+/// the program. Without it, scrolling inside tmux — or at any shell prompt on
+/// the alternate screen — replays arrow keys into the command line instead of
+/// scrolling, which is what the arrows mean to a line editor.
+fn wheel_action(shift: bool, alt_screen: bool) -> WheelAction {
+    if shift || !alt_screen { WheelAction::Viewport } else { WheelAction::Application }
+}
+
 /// Arrow keys an application should see for `lines` of wheel scrolling on the
 /// alternate screen. Positive scrolls back through the application's own view,
 /// which means Up.
@@ -1168,7 +1180,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // every scroll rounds away to nothing.
                 let whole = take_whole_lines(&mut self.scroll_accum, lines);
                 if whole != 0 {
-                    self.wheel_scroll(target, whole);
+                    self.wheel_scroll(target, whole, self.mods.shift_key());
                     self.request_redraw();
                 }
             }
@@ -1523,5 +1535,25 @@ mod tests {
         assert!(cells.iter().all(|c| c.row < rows));
         let (_, row) = preedit_caret(&cells, (0, 0), 4);
         assert!(row <= rows, "anchor row {row} should be at most {rows}");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_our_viewport_on_the_main_screen() {
+        assert_eq!(wheel_action(false, false), WheelAction::Viewport);
+        assert_eq!(wheel_action(true, false), WheelAction::Viewport);
+    }
+
+    #[test]
+    fn the_wheel_reaches_the_application_on_the_alternate_screen() {
+        // less and man have no scrollback of ours, so the wheel drives them.
+        assert_eq!(wheel_action(false, true), WheelAction::Application);
+    }
+
+    #[test]
+    fn shift_takes_the_wheel_back_from_the_application() {
+        // Reported from real use: inside tmux the arrow keys alternate scroll
+        // sends land in the command line instead of scrolling. Shift is the
+        // escape hatch, and it must win on the alternate screen too.
+        assert_eq!(wheel_action(true, true), WheelAction::Viewport);
     }
 }

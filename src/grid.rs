@@ -183,10 +183,18 @@ impl Grid {
                 let s = r * self.cols;
                 self.scrollback.push(self.cells[s..s + self.cols].to_vec());
             }
+            // A viewport that has been scrolled back is anchored to the lines
+            // it is showing, not to a distance from the bottom. Without this,
+            // arriving output would slide those lines out from under the user.
+            if self.view_offset > 0 {
+                self.view_offset += n;
+            }
             if self.scrollback.len() > self.max_scrollback {
                 let excess = self.scrollback.len() - self.max_scrollback;
                 self.scrollback.drain(0..excess);
             }
+            // Dropping the oldest lines can put the viewport past the top.
+            self.view_offset = self.view_offset.min(self.scrollback.len());
         }
         let bg = self.bg;
         for r in self.top..=self.bot {
@@ -812,5 +820,69 @@ mod tests {
         g.view_offset = 1;
         assert_eq!(g.view_row(0).unwrap().len(), 4, "old row stays 4 wide");
         assert_eq!(g.view_row(1).unwrap().len(), 10, "live rows use the new width");
+    }
+
+    #[test]
+    fn output_does_not_slide_a_scrolled_back_viewport() {
+        // Scroll back to "one", then let more output arrive. The user is
+        // anchored to the line they are reading, not to a distance from the
+        // bottom, so "one" must still be the top row.
+        let mut g = feed(8, 2, &["one\r\ntwo\r\nthree"]);
+        g.view_offset = 1;
+        let top = |g: &Grid| -> String {
+            g.view_row(0).unwrap().iter().map(|c| c.c).collect::<String>().trim_end().to_string()
+        };
+        assert_eq!(top(&g), "one");
+
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\r\nfour\r\nfive");
+        assert_eq!(top(&g), "one", "the viewport drifted to {:?}", top(&g));
+        // "two" and "three" scrolled off, so the offset grew by two to keep
+        // pointing at the same line.
+        assert_eq!(g.view_offset, 3);
+    }
+
+    #[test]
+    fn a_live_viewport_keeps_following_new_output() {
+        // view_offset == 0 means "pinned to the bottom" and must stay there.
+        let mut g = feed(8, 2, &["one\r\ntwo"]);
+        assert_eq!(g.view_offset, 0);
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\r\nthree\r\nfour");
+        assert_eq!(g.view_offset, 0);
+        assert_eq!(row_text(&g, 1), "four");
+    }
+
+    #[test]
+    fn trimming_scrollback_clamps_the_viewport() {
+        let mut g = Grid::new(8, 2);
+        g.max_scrollback = 3;
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"a\r\nb\r\nc");
+        }
+        g.view_offset = g.scrollback.len();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\r\nd\r\ne\r\nf\r\ng");
+        }
+        assert_eq!(g.scrollback.len(), 3, "trimmed to max_scrollback");
+        assert!(g.view_offset <= g.scrollback.len(), "offset {} ran past the top", g.view_offset);
+        assert!(g.view_row(0).is_some(), "the top row must still resolve");
+    }
+
+    #[test]
+    fn the_alternate_screen_does_not_grow_scrollback() {
+        // tmux and vim redraw constantly; none of it belongs in our history.
+        let mut g = feed(8, 2, &["one\r\ntwo"]);
+        let before = g.scrollback.len();
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\x1b[?1049h");
+        parser.advance(&mut perf, b"a\r\nb\r\nc\r\nd");
+        assert_eq!(g.scrollback.len(), before);
     }
 }
