@@ -407,6 +407,10 @@ impl App {
                 self.copy_selection();
                 true
             }
+            "v" => {
+                self.paste_clipboard();
+                true
+            }
             "w" => {
                 let id = self.focus;
                 if !self.close_pane(id) {
@@ -690,6 +694,35 @@ impl App {
         let cols = self.panes.get(&id)?.grid.cols;
         let text = selection::extract(sel.range(), cols, |abs| self.row_cells(id, abs));
         (!text.is_empty()).then_some(text)
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    log::error!("no clipboard available: {e}");
+                    return;
+                }
+            }
+        }
+        let text = match self.clipboard.as_mut().map(|c| c.get_text()) {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => {
+                log::error!("could not read the clipboard: {e}");
+                return;
+            }
+            None => return,
+        };
+        if text.is_empty() {
+            return;
+        }
+        let Some(p) = self.panes.get_mut(&self.focus) else { return };
+        let bytes = paste_bytes(&text, p.grid.bracketed_paste);
+        // Pasting is input, so it jumps back to the live screen like typing.
+        p.grid.view_offset = 0;
+        p.pty.write(&bytes);
+        self.request_redraw();
     }
 
     fn copy_selection(&mut self) {
@@ -985,6 +1018,67 @@ impl App {
 /// Rounded to whole pixels so stems stay crisp at the atlas's native scale.
 fn glyph_rect(gi: &font::GlyphInfo, px: f32, py: f32, ascent: f32) -> [f32; 4] {
     [(px + gi.left).round(), (py + ascent - gi.top).round(), gi.w, gi.h]
+}
+
+/// Removes every occurrence of `marker`, including any that removal itself
+/// splices together.
+///
+/// A single pass is not enough: `ESC[20` + `ESC[201~` + `1~` becomes `ESC[201~`
+/// once the inner marker is taken out. Nothing reaches this with an ESC intact
+/// today, but the guarantee belongs with the marker rather than depending on a
+/// filter three branches away — which is the whole reason this is a function
+/// with its own tests.
+fn strip_end_markers(mut s: String, marker: &str) -> String {
+    while s.contains(marker) {
+        s = s.replace(marker, "");
+    }
+    s
+}
+
+/// Encodes clipboard text for the pty.
+///
+/// With bracketed paste on (DECSET 2004) the text is wrapped in markers, so the
+/// program can tell a paste from typing and treat it as literal input — that is
+/// what stops a multi-line paste from running each line as it arrives.
+///
+/// Without it there is no such protection, and the newlines *are* Enter. The
+/// least surprising thing left is to send what was on the clipboard, which is
+/// what every other terminal does.
+///
+/// Either way the text is sanitised first:
+///
+/// - CR and CRLF become LF, so a clipboard from Windows or a browser doesn't
+///   submit twice per line.
+/// - The end marker is stripped from the payload. Pasting text that contains
+///   it would otherwise end bracketed mode early and let the remainder run as
+///   commands — the standard injection against this feature.
+/// - C0 and C1 controls other than tab and newline are dropped, so a stray ESC
+///   — or a bare CSI at U+009B — can't start an escape sequence.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    const START: &str = "\x1b[200~";
+    const END: &str = "\x1b[201~";
+
+    let mut clean = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                // Swallow the LF of a CRLF pair rather than emitting two.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                clean.push('\n');
+            }
+            '\n' | '\t' => clean.push(c),
+            // C0, DEL, and C1 — the last of which includes a standalone CSI at
+            // U+009B, so dropping ESC alone would not be consistent.
+            c if (c as u32) < 0x20 || c as u32 == 0x7f || (0x80..=0x9f).contains(&(c as u32)) => {}
+            c => clean.push(c),
+        }
+    }
+    let clean = strip_end_markers(clean, END);
+
+    if bracketed { format!("{START}{clean}{END}").into_bytes() } else { clean.into_bytes() }
 }
 
 /// Where a wheel event should go.
@@ -1735,5 +1829,118 @@ mod tests {
         // sends land in the command line instead of scrolling. Shift is the
         // escape hatch, and it must win on the alternate screen too.
         assert_eq!(wheel_action(true, true), WheelAction::Viewport);
+    }
+
+    const END: &str = "\x1b[201~";
+
+    fn pasted(text: &str, bracketed: bool) -> String {
+        String::from_utf8(paste_bytes(text, bracketed)).unwrap()
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_the_text_in_markers() {
+        assert_eq!(pasted("ls -la", true), "\x1b[200~ls -la\x1b[201~");
+    }
+
+    #[test]
+    fn without_bracketed_paste_the_text_goes_as_is() {
+        assert_eq!(pasted("ls -la", false), "ls -la");
+    }
+
+    #[test]
+    fn multi_line_text_keeps_its_newlines() {
+        // Bracketed mode is what stops these running; the bytes themselves are
+        // unchanged either way.
+        assert_eq!(pasted("one\ntwo", true), "\x1b[200~one\ntwo\x1b[201~");
+        assert_eq!(pasted("one\ntwo", false), "one\ntwo");
+    }
+
+    #[test]
+    fn crlf_becomes_one_newline() {
+        // A clipboard from a browser or from Windows would otherwise submit
+        // twice for every line.
+        assert_eq!(pasted("a\r\nb\r\nc", false), "a\nb\nc");
+    }
+
+    #[test]
+    fn a_lone_carriage_return_also_becomes_a_newline() {
+        assert_eq!(pasted("a\rb", false), "a\nb");
+    }
+
+    #[test]
+    fn an_embedded_end_marker_cannot_escape_the_brackets() {
+        // The standard injection: text containing the end marker would close
+        // bracketed mode early and let the rest arrive as live keystrokes.
+        let hostile = "safe\x1b[201~rm -rf /\n";
+        let out = pasted(hostile, true);
+        assert_eq!(out.matches("\x1b[201~").count(), 1, "only the real terminator: {out:?}");
+        assert!(out.ends_with("\x1b[201~"));
+        assert!(!out.contains("\x1b[201~rm"), "the payload still breaks out: {out:?}");
+    }
+
+    #[test]
+    fn escape_sequences_in_the_clipboard_are_defused() {
+        // Without this a paste could set the title, switch screens, or worse.
+        let out = pasted("before\x1b]0;pwned\x07after", false);
+        assert!(!out.contains('\x1b'), "ESC survived: {out:?}");
+        assert!(!out.contains('\x07'), "BEL survived: {out:?}");
+        assert_eq!(out, "before]0;pwnedafter");
+    }
+
+    #[test]
+    fn tabs_survive_but_other_controls_do_not() {
+        // Tab is real input — pasting indented code must keep it.
+        assert_eq!(pasted("a\tb", false), "a\tb");
+        assert_eq!(pasted("a\x00\x08\x7fb", false), "ab");
+    }
+
+    #[test]
+    fn multibyte_text_is_untouched() {
+        assert_eq!(pasted("日本語のテキスト", true), "\x1b[200~日本語のテキスト\x1b[201~");
+    }
+
+    #[test]
+    fn empty_text_still_produces_well_formed_markers() {
+        assert_eq!(pasted("", true), "\x1b[200~\x1b[201~");
+        assert_eq!(pasted("", false), "");
+    }
+
+    #[test]
+    fn removing_the_end_marker_cannot_splice_a_new_one() {
+        // Removing the inner marker joins "ESC[20" to "1~" and makes another,
+        // so one pass leaves the payload able to close bracketed mode early.
+        let hostile = "\x1b[20\x1b[201~1~rm -rf /".to_string();
+        assert!(
+            hostile.replace(END, "").contains(END),
+            "the premise: a single pass must be insufficient here"
+        );
+        assert!(!strip_end_markers(hostile, END).contains(END));
+    }
+
+    #[test]
+    fn stripping_markers_leaves_ordinary_text_alone() {
+        assert_eq!(strip_end_markers("ls -la".into(), END), "ls -la");
+        assert_eq!(strip_end_markers(String::new(), END), "");
+    }
+
+    #[test]
+    fn an_end_marker_never_survives_a_paste() {
+        // The property, through the real encoder: whatever the clipboard held,
+        // exactly one terminator comes out and it is ours.
+        for hostile in
+            ["safe\x1b[201~rm -rf /\n", "\x1b[20\x1b[201~1~rm -rf /", "\x1b[201~\x1b[201~\x1b[201~"]
+        {
+            let out = pasted(hostile, true);
+            assert_eq!(out.matches(END).count(), 1, "{hostile:?} produced {out:?}");
+            assert!(out.ends_with(END));
+        }
+    }
+
+    #[test]
+    fn c1_controls_are_dropped_too() {
+        // U+009B is CSI on its own; dropping ESC but not this would be an odd
+        // place to stop.
+        let out = pasted("a\u{9b}0;pwned\u{7}b", false);
+        assert_eq!(out, "a0;pwnedb");
     }
 }

@@ -36,6 +36,7 @@ on both platforms, so the same muscle memory works over ssh.
 | Left click | Focus a pane, and start a selection |
 | Drag | Select text; double click for a word, triple for a line |
 | `Cmd+C` | Copy the selection |
+| `Cmd+V` | Paste |
 
 Mac keyboards have no PageUp, so `Cmd+Shift+Up`/`Down` is the binding that
 actually gets used there. They have no Home/End either — `Cmd+Home`/`End` is
@@ -103,11 +104,13 @@ coverage.
 cargo test
 ```
 
-136 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+151 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
 multibyte text, columns after a double-width character, drag direction,
-extraction and padding), the split tree
+extraction and padding), paste encoding (bracketed markers, CRLF, defusing
+escape sequences, and an end marker that a single removal pass would splice
+back together), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
 accumulation, alternate-scroll encoding, IME composition layout (wrapping, kana
@@ -120,7 +123,6 @@ The GPU path itself is not covered by tests — it needs a display.
 
 ## Not done yet
 
-- **Paste.** Copy works; `Cmd+V` and bracketed paste are still to come.
 - **Joining wrapped lines on copy.** A command long enough to wrap comes out
   with a newline in the middle, because rows don't record whether they wrapped.
 - **Reflow on resize.** Lines are truncated rather than re-wrapped when the
