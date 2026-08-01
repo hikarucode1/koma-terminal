@@ -33,7 +33,9 @@ on both platforms, so the same muscle memory works over ssh.
 | `Cmd+Home` / `End` | Jump to the oldest line / back to the prompt |
 | Mouse wheel, trackpad | Scroll the pane under the pointer |
 | `Shift` + wheel | Scroll our own scrollback, bypassing the program |
-| Left click | Focus a pane |
+| Left click | Focus a pane, and start a selection |
+| Drag | Select text; double click for a word, triple for a line |
+| `Cmd+C` | Copy the selection |
 
 Mac keyboards have no PageUp, so `Cmd+Shift+Up`/`Down` is the binding that
 actually gets used there. They have no Home/End either — `Cmd+Home`/`End` is
@@ -72,6 +74,7 @@ handling of `Ime::Preedit`/`Ime::Commit`; during composition winit suppresses
 ```
 main.rs    winit event loop, pane bookkeeping, frame building
  ├ pane.rs  n-ary split tree -> pane rects (the tiling)
+ ├ selection.rs  selection ranges, word snapping, text extraction
  ├ pty.rs   spawns $SHELL on a pty; a reader thread wakes the event loop
  ├ grid.rs  cell grid + scrollback + the vte::Perform that mutates it
  ├ font.rs  font lookup (fontdb), rasterising (swash), shelf-packed atlas
@@ -100,9 +103,11 @@ coverage.
 cargo test
 ```
 
-113 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
-anchoring, SGR including truecolor, alt screen, wide characters, DSR
-replies), the split tree
+136 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+anchoring, stable row ids across trimming, SGR including truecolor, alt
+screen, wide characters, DSR replies), selection (word snapping over paths and
+multibyte text, columns after a double-width character, drag direction,
+extraction and padding), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
 accumulation, alternate-scroll encoding, IME composition layout (wrapping, kana
@@ -115,8 +120,9 @@ The GPU path itself is not covered by tests — it needs a display.
 
 ## Not done yet
 
-- **Text selection and clipboard.** The biggest gap; needs mouse drag to grid
-  coordinates plus `Cmd+C`/`Cmd+V`.
+- **Paste.** Copy works; `Cmd+V` and bracketed paste are still to come.
+- **Joining wrapped lines on copy.** A command long enough to wrap comes out
+  with a newline in the middle, because rows don't record whether they wrapped.
 - **Reflow on resize.** Lines are truncated rather than re-wrapped when the
   window narrows.
 - **A scrollbar**, or any indicator of where you are in the scrollback.

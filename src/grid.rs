@@ -56,6 +56,10 @@ pub struct Grid {
     /// Lines that have scrolled off the top. Front is oldest.
     pub scrollback: Vec<Vec<Cell>>,
     pub max_scrollback: usize,
+    /// Lines dropped off the front of `scrollback` over the session. Added to
+    /// a scrollback index it gives a row id that stays valid as history is
+    /// trimmed, which is what selection coordinates are built on.
+    pub trimmed: usize,
     /// How many lines up from the live screen the viewport is scrolled.
     pub view_offset: usize,
 
@@ -96,6 +100,7 @@ impl Grid {
             cells: vec![Cell::default(); cols * rows],
             scrollback: Vec::new(),
             max_scrollback: 10_000,
+            trimmed: 0,
             view_offset: 0,
             cx: 0,
             cy: 0,
@@ -147,6 +152,28 @@ impl Grid {
         }
     }
 
+    /// Row id for viewport row `y`, stable as the line scrolls into history.
+    ///
+    /// Viewport rows above the fold come from scrollback and those below from
+    /// the live screen, but both land on the same expression: history grows by
+    /// exactly as much as the screen scrolls, so the id of a given line never
+    /// changes.
+    pub fn abs_row(&self, y: usize) -> usize {
+        self.trimmed + self.scrollback.len() + y - self.view_offset
+    }
+
+    /// The row with id `abs`, from history or the live screen. `None` once the
+    /// line has been trimmed away, or for ids past the bottom.
+    pub fn row_at(&self, abs: usize) -> Option<&[Cell]> {
+        let idx = abs.checked_sub(self.trimmed)?;
+        if idx < self.scrollback.len() {
+            return self.scrollback.get(idx).map(|r| r.as_slice());
+        }
+        let sy = idx - self.scrollback.len();
+        let s = sy * self.cols;
+        self.cells.get(s..s + self.cols)
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -192,6 +219,7 @@ impl Grid {
             if self.scrollback.len() > self.max_scrollback {
                 let excess = self.scrollback.len() - self.max_scrollback;
                 self.scrollback.drain(0..excess);
+                self.trimmed += excess;
             }
             // Dropping the oldest lines can put the viewport past the top.
             self.view_offset = self.view_offset.min(self.scrollback.len());
@@ -884,5 +912,66 @@ mod tests {
         parser.advance(&mut perf, b"\x1b[?1049h");
         parser.advance(&mut perf, b"a\r\nb\r\nc\r\nd");
         assert_eq!(g.scrollback.len(), before);
+    }
+
+    #[test]
+    fn a_row_id_stays_with_its_line_as_it_scrolls_away() {
+        // "one" is on screen, then scrolls into history. Its id must not move,
+        // or a selection made before the output would drift.
+        let mut g = feed(8, 2, &["one\r\ntwo"]);
+        let id_of_one = g.abs_row(0);
+        let text = |g: &Grid, abs| -> String {
+            g.row_at(abs).unwrap().iter().map(|c| c.c).collect::<String>().trim_end().to_string()
+        };
+        assert_eq!(text(&g, id_of_one), "one");
+
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\r\nthree\r\nfour");
+        assert_eq!(text(&g, id_of_one), "one", "the id followed the wrong line");
+    }
+
+    #[test]
+    fn row_ids_survive_history_being_trimmed() {
+        let mut g = Grid::new(8, 2);
+        g.max_scrollback = 2;
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"a\r\nb\r\nc\r\nd\r\ne");
+        // "a" was dropped, so its id must go dead rather than being handed to
+        // whatever line moved into its slot.
+        assert_eq!(g.trimmed, 1);
+        assert!(g.row_at(0).is_none(), "a trimmed line must not resolve");
+        let text = |abs| -> Option<String> {
+            g.row_at(abs).map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+        };
+        assert_eq!(text(1).as_deref(), Some("b"), "ids did not shift with the trim");
+        assert_eq!(text(2).as_deref(), Some("c"));
+        assert_eq!(text(3).as_deref(), Some("d"));
+        assert_eq!(text(4).as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn row_ids_line_up_across_the_scrollback_fold() {
+        // With the viewport scrolled back, rows above the fold come from
+        // history and rows below from the live screen; ids must run
+        // continuously across the join.
+        let mut g = feed(8, 3, &["a\r\nb\r\nc\r\nd\r\ne"]);
+        g.view_offset = 2;
+        let ids: Vec<usize> = (0..3).map(|y| g.abs_row(y)).collect();
+        assert_eq!(ids, vec![ids[0], ids[0] + 1, ids[0] + 2], "ids must be contiguous");
+        for (y, &abs) in ids.iter().enumerate() {
+            let via_view: String = g.view_row(y).unwrap().iter().map(|c| c.c).collect();
+            let via_id: String = g.row_at(abs).unwrap().iter().map(|c| c.c).collect();
+            assert_eq!(via_view, via_id, "row {y} disagrees with id {abs}");
+        }
+    }
+
+    #[test]
+    fn an_id_past_the_bottom_does_not_resolve() {
+        let g = feed(8, 2, &["a\r\nb"]);
+        let last = g.abs_row(1);
+        assert!(g.row_at(last).is_some());
+        assert!(g.row_at(last + 1).is_none());
     }
 }
