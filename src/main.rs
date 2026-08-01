@@ -9,10 +9,12 @@ mod grid;
 mod input;
 mod pane;
 mod pty;
+mod selection;
 mod theme;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
@@ -30,6 +32,7 @@ use grid::{
 };
 use pane::{Axis, Node, PaneId, Rect};
 use pty::Pty;
+use selection::{Mode as SelMode, Point, Selection};
 use theme::{Theme, to_linear};
 
 /// Gap between the window edge and the pane area, in logical pixels.
@@ -99,6 +102,14 @@ struct App {
     wheel_target: PaneId,
     /// Text the IME is composing for the focused pane, if any.
     preedit: Preedit,
+    /// Selection in progress or finished, and the pane it belongs to.
+    selection: Option<(PaneId, Selection)>,
+    /// True while the left button is down, so motion extends the selection.
+    dragging: bool,
+    /// Last left-press, for turning repeats into word and line selection.
+    last_click: Option<(Instant, PaneId, usize, usize)>,
+    click_streak: u32,
+    clipboard: Option<arboard::Clipboard>,
     theme: Theme,
     /// Reused frame buffer so we're not allocating a Vec per redraw.
     instances: Vec<Inst>,
@@ -122,6 +133,11 @@ impl App {
             scroll_accum: 0.0,
             wheel_target: 0,
             preedit: Preedit::default(),
+            selection: None,
+            dragging: false,
+            last_click: None,
+            click_streak: 0,
+            clipboard: None,
             theme: Theme::default(),
             instances: Vec::new(),
         }
@@ -377,6 +393,15 @@ impl App {
                 self.split_focused(Axis::Vertical);
                 true
             }
+            "c" => {
+                // Only claim the key when there is something to copy, so
+                // Ctrl+Shift+C still reaches the shell when nothing is selected.
+                if self.selected_text().is_some() {
+                    self.copy_selection();
+                    return true;
+                }
+                false
+            }
             "w" => {
                 let id = self.focus;
                 if !self.close_pane(id) {
@@ -560,6 +585,125 @@ impl App {
         }
     }
 
+    /// Turns a window position into a cell in some pane, as `(pane, abs row,
+    /// column)`. Columns and rows are clamped to the pane, so dragging off the
+    /// edge extends to it rather than stopping.
+    fn cell_at(&self, px: f32, py: f32) -> Option<(PaneId, usize, usize)> {
+        let (cw, ch) = self.cell_size();
+        let (id, rect) = self.layout().into_iter().find(|(_, r)| r.contains(px, py))?;
+        let p = self.panes.get(&id)?;
+        let rows = ((rect.h / ch).floor().max(1.0) as usize).min(p.grid.rows);
+        let cols = ((rect.w / cw).floor().max(1.0) as usize).min(p.grid.cols);
+        let y = (((py - rect.y) / ch).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        let x = (((px - rect.x) / cw).floor().max(0.0) as usize).min(cols);
+        Some((id, p.grid.abs_row(y), x))
+    }
+
+    /// As `cell_at`, but for a drag that has wandered outside every pane: it
+    /// stays with the pane the selection started in.
+    fn drag_cell(&self, px: f32, py: f32, id: PaneId) -> Option<(usize, usize)> {
+        let (cw, ch) = self.cell_size();
+        let p = self.panes.get(&id)?;
+        let rect = p.rect;
+        let rows = ((rect.h / ch).floor().max(1.0) as usize).min(p.grid.rows);
+        let cols = ((rect.w / cw).floor().max(1.0) as usize).min(p.grid.cols);
+        let y = (((py - rect.y) / ch).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        let x = (((px - rect.x) / cw).floor().max(0.0) as usize).min(cols);
+        Some((p.grid.abs_row(y), x))
+    }
+
+    fn row_chars(&self, id: PaneId, abs: usize) -> Option<Vec<char>> {
+        let p = self.panes.get(&id)?;
+        // A wide character's spacer cell holds a blank; keeping it would put a
+        // stray space after every CJK glyph on the clipboard.
+        Some(
+            p.grid
+                .row_at(abs)?
+                .iter()
+                .filter(|c| c.flags & FLAG_WIDE_SPACER == 0)
+                .map(|c| c.c)
+                .collect(),
+        )
+    }
+
+    /// Expands a click to the span the current mode selects: the cell itself,
+    /// the word around it, or the whole line.
+    fn span_for(&self, id: PaneId, abs: usize, col: usize, mode: SelMode) -> (Point, Point) {
+        match mode {
+            SelMode::Char => (Point::new(abs, col), Point::new(abs, col)),
+            SelMode::Word => {
+                let row = self.row_chars(id, abs).unwrap_or_default();
+                let (s, e) = selection::word_at(&row, col);
+                (Point::new(abs, s), Point::new(abs, e))
+            }
+            SelMode::Line => {
+                let cols = self.panes.get(&id).map(|p| p.grid.cols).unwrap_or(0);
+                (Point::new(abs, 0), Point::new(abs, cols))
+            }
+        }
+    }
+
+    fn begin_selection(&mut self, px: f32, py: f32) {
+        let Some((id, abs, col)) = self.cell_at(px, py) else {
+            self.selection = None;
+            return;
+        };
+        // Repeat clicks in the same cell cycle char -> word -> line.
+        let now = Instant::now();
+        let repeat = self.last_click.is_some_and(|(t, lid, lrow, lcol)| {
+            now.duration_since(t) < Duration::from_millis(400)
+                && (lid, lrow, lcol) == (id, abs, col)
+        });
+        self.click_streak = if repeat { self.click_streak + 1 } else { 1 };
+        self.last_click = Some((now, id, abs, col));
+
+        let mode = match self.click_streak {
+            1 => SelMode::Char,
+            2 => SelMode::Word,
+            _ => SelMode::Line,
+        };
+        let span = self.span_for(id, abs, col, mode);
+        self.selection = Some((id, Selection::new(span, mode)));
+        self.dragging = true;
+    }
+
+    fn extend_selection(&mut self, px: f32, py: f32) {
+        let Some((id, sel)) = self.selection else { return };
+        let Some((abs, col)) = self.drag_cell(px, py, id) else { return };
+        let span = self.span_for(id, abs, col, sel.mode);
+        if let Some((_, s)) = self.selection.as_mut() {
+            s.extend_to(span);
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (id, sel) = self.selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let cols = self.panes.get(&id)?.grid.cols;
+        let text = selection::extract(sel.range(), cols, |abs| self.row_chars(id, abs));
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_text() else { return };
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    log::error!("no clipboard available: {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(c) = self.clipboard.as_mut() {
+            if let Err(e) = c.set_text(text) {
+                log::error!("could not write to the clipboard: {e}");
+            }
+        }
+    }
+
     fn pane_at(&self, px: f32, py: f32) -> Option<PaneId> {
         self.layout().into_iter().find(|(_, r)| r.contains(px, py)).map(|(id, _)| id)
     }
@@ -628,6 +772,7 @@ impl App {
             let g = &pane.grid;
 
             let pane_bg = if focused { theme.bg } else { theme.bg_unfocused };
+            let sel_here = self.selection.and_then(|(sid, s)| (sid == *id).then_some(s));
             inst.push(Inst::solid(rect.x, rect.y, rect.w, rect.h, to_linear(pane_bg, 1.0)));
 
             let rows = g.rows.min((rect.h / ch).floor().max(0.0) as usize);
@@ -641,13 +786,24 @@ impl App {
                 let max_cols = max_cols.min(row.len());
 
                 // Cell backgrounds first, so no glyph gets painted over.
+                let abs = g.abs_row(y);
                 for x in 0..max_cols {
                     let cell = &row[x];
                     if cell.flags & FLAG_WIDE_SPACER != 0 {
                         continue;
                     }
                     let (_, bg) = resolve_pair(cell, theme);
-                    if bg != pane_bg {
+                    let selected = sel_here.is_some_and(|s| s.contains(abs, x, g.cols));
+                    if selected {
+                        let w = if is_wide(row, x) { cw * 2.0 } else { cw };
+                        inst.push(Inst::solid(
+                            rect.x + x as f32 * cw,
+                            py,
+                            w,
+                            ch,
+                            to_linear(theme.selection_bg, 1.0),
+                        ));
+                    } else if bg != pane_bg {
                         let w = if is_wide(row, x) { cw * 2.0 } else { cw };
                         inst.push(Inst::solid(
                             rect.x + x as f32 * cw,
@@ -1147,14 +1303,32 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
+                if self.dragging {
+                    self.extend_selection(self.cursor_pos.0, self.cursor_pos.1);
+                    self.request_redraw();
+                }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed && button == MouseButton::Left {
-                    if let Some(id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) {
-                        if id != self.focus {
-                            self.set_focus(id);
-                            self.update_title();
+                if button != MouseButton::Left {
+                    return;
+                }
+                match state {
+                    ElementState::Pressed => {
+                        if let Some(id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) {
+                            if id != self.focus {
+                                self.set_focus(id);
+                                self.update_title();
+                            }
+                        }
+                        self.begin_selection(self.cursor_pos.0, self.cursor_pos.1);
+                        self.request_redraw();
+                    }
+                    ElementState::Released => {
+                        self.dragging = false;
+                        // A click that never moved leaves nothing highlighted.
+                        if self.selection.is_some_and(|(_, s)| s.is_empty()) {
+                            self.selection = None;
                             self.request_redraw();
                         }
                     }

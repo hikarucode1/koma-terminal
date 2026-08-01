@@ -11,6 +11,8 @@ pub struct Theme {
     pub divider_focus: [u8; 3],
     /// Background of panes that don't have focus, so the active one stands out.
     pub bg_unfocused: [u8; 3],
+    /// Backdrop for selected text.
+    pub selection_bg: [u8; 3],
     /// Backdrop for text the IME is still composing.
     pub preedit_bg: [u8; 3],
     /// Underline under composing text; the active segment uses `cursor`.
@@ -27,6 +29,7 @@ impl Default for Theme {
             divider: [0x2a, 0x2f, 0x3a],
             divider_focus: [0x7a, 0xa2, 0xf7],
             bg_unfocused: [0x16, 0x19, 0x20],
+            selection_bg: [0x33, 0x41, 0x5e],
             preedit_bg: [0x2c, 0x33, 0x44],
             preedit_underline: [0x9a, 0xa5, 0xc4],
             palette: [
