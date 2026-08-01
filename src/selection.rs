@@ -37,23 +37,48 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '~' | '@' | '+' | '=' | '%')
 }
 
-/// Grows `col` out to the word around it. Returns a half-open column range.
-/// On a non-word character the "word" is just that one cell, which is what
-/// double-clicking a space or a bracket should give you.
-pub fn word_at(row: &[char], col: usize) -> (usize, usize) {
+/// The character governing cell `i`: its own, or — for the spacer half of a
+/// double-width character — the one it belongs to.
+fn governing(row: &[Option<char>], i: usize) -> Option<char> {
+    match row.get(i) {
+        Some(Some(c)) => Some(*c),
+        Some(None) if i > 0 => row[i - 1],
+        _ => None,
+    }
+}
+
+/// Grows `col` out to the word around it, in **grid columns** — the same space
+/// a mouse position lands in. A double-width character occupies two columns,
+/// the second of which is `None`, and both belong to the same word.
+///
+/// Returns a half-open column range. On a non-word character the "word" is that
+/// character alone, which is what double-clicking a space or a bracket should
+/// give you.
+pub fn word_at(row: &[Option<char>], col: usize) -> (usize, usize) {
     if row.is_empty() {
         return (0, 0);
     }
     let col = col.min(row.len() - 1);
-    if !is_word_char(row[col]) {
-        return (col, col + 1);
+    let is_word = |i: usize| governing(row, i).is_some_and(is_word_char);
+
+    if !is_word(col) {
+        // Still take the whole character, spacer included.
+        let mut start = col;
+        while start > 0 && row[start].is_none() {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < row.len() && row[end].is_none() {
+            end += 1;
+        }
+        return (start, end);
     }
     let mut start = col;
-    while start > 0 && is_word_char(row[start - 1]) {
+    while start > 0 && is_word(start - 1) {
         start -= 1;
     }
     let mut end = col + 1;
-    while end < row.len() && is_word_char(row[end]) {
+    while end < row.len() && is_word(end) {
         end += 1;
     }
     (start, end)
@@ -109,22 +134,27 @@ impl Selection {
 
 /// Pulls the selected text out, one line per row.
 ///
-/// Trailing blanks are dropped from each line: a terminal row is padded to the
-/// full width, and nobody wants that padding on the clipboard.
+/// Rows are indexed in **grid columns**, so the numbers coming from a mouse
+/// position can be used directly. The spacer half of a double-width character
+/// is `None` and drops out, which keeps a stray space from following every CJK
+/// glyph onto the clipboard.
+///
+/// Trailing blanks go too: a terminal row is padded to the full width, and
+/// nobody wants that padding.
 pub fn extract(
     range: (Point, Point),
     cols: usize,
-    row_at: impl Fn(AbsRow) -> Option<Vec<char>>,
+    row_at: impl Fn(AbsRow) -> Option<Vec<Option<char>>>,
 ) -> String {
     let (start, end) = range;
     let mut out = String::new();
     for row in start.row..=end.row {
         let from = if row == start.row { start.col } else { 0 };
         let to = if row == end.row { end.col } else { cols };
-        if let Some(chars) = row_at(row) {
-            let hi = to.min(chars.len());
+        if let Some(cells) = row_at(row) {
+            let hi = to.min(cells.len());
             let line: String =
-                if from < hi { chars[from..hi].iter().collect() } else { String::new() };
+                if from < hi { cells[from..hi].iter().flatten().collect() } else { String::new() };
             out.push_str(line.trim_end());
         }
         if row != end.row {
@@ -138,23 +168,32 @@ pub fn extract(
 mod tests {
     use super::*;
 
-    fn chars(s: &str) -> Vec<char> {
-        s.chars().collect()
+    /// A row in grid columns: a double-width character takes two entries, the
+    /// second being the spacer.
+    fn cells(s: &str) -> Vec<Option<char>> {
+        let mut out = Vec::new();
+        for c in s.chars() {
+            out.push(Some(c));
+            if unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) == 2 {
+                out.push(None);
+            }
+        }
+        out
     }
 
     /// A two-line screen, padded to width like a real terminal row.
-    fn fixture(row: AbsRow) -> Option<Vec<char>> {
+    fn fixture(row: AbsRow) -> Option<Vec<Option<char>>> {
         let text = match row {
             10 => "cargo test --locked  ",
             11 => "hello world          ",
             _ => return None,
         };
-        Some(chars(text))
+        Some(cells(text))
     }
 
     #[test]
     fn a_word_grows_out_from_the_middle() {
-        let row = chars("hello world");
+        let row = cells("hello world");
         assert_eq!(word_at(&row, 7), (6, 11));
         assert_eq!(word_at(&row, 0), (0, 5));
     }
@@ -162,16 +201,16 @@ mod tests {
     #[test]
     fn a_path_counts_as_one_word() {
         // Double-clicking a path or a flag should not stop at every separator.
-        let row = chars("run /usr/local/bin/koma --locked now");
+        let row = cells("run /usr/local/bin/koma --locked now");
         let (s, e) = word_at(&row, 10);
-        assert_eq!(row[s..e].iter().collect::<String>(), "/usr/local/bin/koma");
+        assert_eq!(row[s..e].iter().flatten().collect::<String>(), "/usr/local/bin/koma");
         let (s, e) = word_at(&row, 26);
-        assert_eq!(row[s..e].iter().collect::<String>(), "--locked");
+        assert_eq!(row[s..e].iter().flatten().collect::<String>(), "--locked");
     }
 
     #[test]
     fn a_non_word_character_selects_only_itself() {
-        let row = chars("a (b)");
+        let row = cells("a (b)");
         assert_eq!(word_at(&row, 2), (2, 3));
         assert_eq!(word_at(&row, 1), (1, 2));
     }
@@ -179,7 +218,7 @@ mod tests {
     #[test]
     fn word_lookup_survives_the_edges() {
         assert_eq!(word_at(&[], 5), (0, 0));
-        let row = chars("ab");
+        let row = cells("ab");
         assert_eq!(word_at(&row, 99), (0, 2), "a column past the end clamps");
     }
 
@@ -252,16 +291,72 @@ mod tests {
 
     #[test]
     fn word_selection_handles_multibyte_text() {
-        // char columns, not bytes: kana must not split mid-character.
-        let row = chars("cd ~/日本語のパス here");
-        let (s, e) = word_at(&row, 6);
-        assert_eq!(row[s..e].iter().collect::<String>(), "~/日本語のパス");
+        // Grid columns, not bytes and not char indices. Each kana takes two
+        // columns, and a word must not stop at the spacer half.
+        let row = cells("cd ~/日本語のパス here");
+        let (s, e) = word_at(&row, 5);
+        assert_eq!(row[s..e].iter().flatten().collect::<String>(), "~/日本語のパス");
+    }
+
+    #[test]
+    fn a_column_after_a_wide_character_still_lands_on_the_right_text() {
+        // Regression, reported from review: mouse columns are grid columns, but
+        // dropping the spacers made the row char-indexed, so everything after a
+        // double-width character came out shifted left. Selecting the columns
+        // that show "cargo" used to yield "go".
+        let row = "あ い う  cargo";
+        let cols = cells(row).len();
+        let fixture = |_| Some(cells(row));
+
+        // Where "cargo" actually starts on screen.
+        let start = cells(row).iter().position(|c| *c == Some('c')).unwrap();
+        // Three kana at two columns each, three spaces: "cargo" begins at 10.
+        assert_eq!(start, 10, "the fixture is not laid out as expected");
+
+        let range = (Point::new(0, start), Point::new(0, start + 5));
+        assert_eq!(extract(range, cols, fixture), "cargo");
+    }
+
+    #[test]
+    fn a_wide_word_and_its_highlight_agree() {
+        // The other half of the same bug: word_at returned char indices while
+        // the highlight used grid columns, so the copied text and the
+        // highlighted cells disagreed.
+        let row = cells("あ い う  cargo");
+        let col = row.iter().position(|c| *c == Some('c')).unwrap();
+        let (s, e) = word_at(&row, col);
+        assert_eq!(row[s..e].iter().flatten().collect::<String>(), "cargo");
+        assert_eq!((s, e), (col, col + 5), "word bounds must be grid columns");
+    }
+
+    #[test]
+    fn a_double_width_character_selects_whole() {
+        // Clicking either half of a wide character takes the whole thing.
+        let row = cells("あい");
+        assert_eq!(word_at(&row, 0), (0, 4), "kana are word characters, so both");
+        assert_eq!(word_at(&row, 1), (0, 4), "the spacer belongs to its character");
+
+        let punct = cells("（あ");
+        assert_eq!(word_at(&punct, 0), (0, 2), "a wide non-word char, spacer included");
+        assert_eq!(word_at(&punct, 1), (0, 2));
+    }
+
+    #[test]
+    fn extraction_drops_the_spacer_not_the_column() {
+        // One space between the kana and "x", not two.
+        let row = "あx";
+        let cols = cells(row).len();
+        assert_eq!(cols, 3);
+        assert_eq!(
+            extract((Point::new(0, 0), Point::new(0, 3)), cols, |_| Some(cells(row))),
+            "あx"
+        );
     }
 
     #[test]
     fn a_word_drag_keeps_whole_words_at_both_ends() {
         // Double-click "test", drag onto "loc|ked": both ends stay snapped.
-        let row = chars("cargo test --locked");
+        let row = cells("cargo test --locked");
         let start = {
             let (s, e) = word_at(&row, 7);
             (Point::new(10, s), Point::new(10, e))

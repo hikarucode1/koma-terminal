@@ -182,6 +182,13 @@ impl App {
             if cols != p.grid.cols || rows != p.grid.rows {
                 p.grid.resize(cols, rows);
                 p.pty.resize(cols as u16, rows as u16);
+                // resize() drops rows off the top without pushing them to
+                // scrollback, so row ids shift and a live selection would point
+                // at unrelated lines.
+                if self.selection.is_some_and(|(sid, _)| sid == id) {
+                    self.selection = None;
+                    self.dragging = false;
+                }
             }
         }
         // Panes just moved, so the IME's anchor is stale. Doing it here covers
@@ -394,13 +401,11 @@ impl App {
                 true
             }
             "c" => {
-                // Only claim the key when there is something to copy, so
-                // Ctrl+Shift+C still reaches the shell when nothing is selected.
-                if self.selected_text().is_some() {
-                    self.copy_selection();
-                    return true;
-                }
-                false
+                // Always consume it. Falling through would reach input::encode,
+                // and under the Ctrl+Shift leader that means Ctrl+C — pressing
+                // the copy key with nothing selected would kill the running job.
+                self.copy_selection();
+                true
             }
             "w" => {
                 let id = self.focus;
@@ -612,16 +617,17 @@ impl App {
         Some((p.grid.abs_row(y), x))
     }
 
-    fn row_chars(&self, id: PaneId, abs: usize) -> Option<Vec<char>> {
+    /// The row as one entry per **grid column**, so mouse columns index it
+    /// directly. The spacer half of a double-width character is `None`: it must
+    /// keep its column (or every column after a CJK glyph would be off by one)
+    /// while contributing nothing to the text.
+    fn row_cells(&self, id: PaneId, abs: usize) -> Option<Vec<Option<char>>> {
         let p = self.panes.get(&id)?;
-        // A wide character's spacer cell holds a blank; keeping it would put a
-        // stray space after every CJK glyph on the clipboard.
         Some(
             p.grid
                 .row_at(abs)?
                 .iter()
-                .filter(|c| c.flags & FLAG_WIDE_SPACER == 0)
-                .map(|c| c.c)
+                .map(|c| (c.flags & FLAG_WIDE_SPACER == 0).then_some(c.c))
                 .collect(),
         )
     }
@@ -632,7 +638,7 @@ impl App {
         match mode {
             SelMode::Char => (Point::new(abs, col), Point::new(abs, col)),
             SelMode::Word => {
-                let row = self.row_chars(id, abs).unwrap_or_default();
+                let row = self.row_cells(id, abs).unwrap_or_default();
                 let (s, e) = selection::word_at(&row, col);
                 (Point::new(abs, s), Point::new(abs, e))
             }
@@ -657,7 +663,7 @@ impl App {
         self.click_streak = if repeat { self.click_streak + 1 } else { 1 };
         self.last_click = Some((now, id, abs, col));
 
-        let mode = match self.click_streak {
+        let mode = match self.click_streak % 3 {
             1 => SelMode::Char,
             2 => SelMode::Word,
             _ => SelMode::Line,
@@ -682,7 +688,7 @@ impl App {
             return None;
         }
         let cols = self.panes.get(&id)?.grid.cols;
-        let text = selection::extract(sel.range(), cols, |abs| self.row_chars(id, abs));
+        let text = selection::extract(sel.range(), cols, |abs| self.row_cells(id, abs));
         (!text.is_empty()).then_some(text)
     }
 
