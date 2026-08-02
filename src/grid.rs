@@ -197,17 +197,73 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        // No reflow: copy the bottom-anchored window of old content across.
+
+        // Where the surviving window starts when shrinking.
+        //
+        // Take from below the cursor first — those rows are the unused tail of
+        // the screen — and only push from the top for whatever is still needed.
+        // Doing it the other way round sends real output to history while blank
+        // rows sit underneath, which is what a pane with a few lines of output
+        // and a prompt looks like every time you split it.
+        //
+        // The result always keeps the cursor: `cy + 1 - rows` at most, which is
+        // at most `cy`.
+        let shrink_from = if rows < self.rows {
+            let below = self.rows - 1 - self.cy;
+            (self.rows - rows).saturating_sub(below)
+        } else {
+            0
+        };
+
+        // Rows falling off the top are history, not rubbish. Splitting a pane
+        // shrinks it, and without this everything above the fold vanished with
+        // no way to scroll back to it.
+
+        if rows < self.rows && !self.alt_active {
+            for r in 0..shrink_from {
+                let s = r * self.cols;
+                self.scrollback.push(self.cells[s..s + self.cols].to_vec());
+            }
+            if self.scrollback.len() > self.max_scrollback {
+                let excess = self.scrollback.len() - self.max_scrollback;
+                self.scrollback.drain(0..excess);
+                self.trimmed += excess;
+            }
+        }
+
+        // Growing pulls that history back rather than opening blank space
+        // above the cursor, so closing a split undoes what opening it did.
+        let pulled = if rows > self.rows && !self.alt_active {
+            (rows - self.rows).min(self.scrollback.len())
+        } else {
+            0
+        };
+
+        // No reflow: the surviving window keeps its old wrapping.
         let mut next = vec![Cell::default(); cols * rows];
-        let copy_rows = self.rows.min(rows);
         let copy_cols = self.cols.min(cols);
-        let src_start = self.rows - copy_rows;
-        let dst_start = rows - copy_rows;
-        for r in 0..copy_rows {
+        let src_start = if rows < self.rows { shrink_from } else { 0 };
+        let keep = (self.rows - src_start).min(rows - pulled);
+        let dst_start = rows - keep;
+
+        for r in 0..keep {
             for c in 0..copy_cols {
                 next[(dst_start + r) * cols + c] = self.cells[(src_start + r) * self.cols + c];
             }
         }
+        // The pulled lines sit directly above what was on screen; if history
+        // ran short, the gap is left at the very top.
+        for i in 0..pulled {
+            let row = &self.scrollback[self.scrollback.len() - pulled + i];
+            let dst = (dst_start - pulled + i) * cols;
+            let n = copy_cols.min(row.len());
+            next[dst..dst + n].copy_from_slice(&row[..n]);
+        }
+        if pulled > 0 {
+            let keep_back = self.scrollback.len() - pulled;
+            self.scrollback.truncate(keep_back);
+        }
+
         self.cells = next;
         self.cx = self.cx.min(cols - 1);
         self.cy = (self.cy + dst_start).saturating_sub(src_start).min(rows - 1);
@@ -685,7 +741,7 @@ mod tests {
         g
     }
 
-    fn row_text(g: &Grid, y: usize) -> String {
+    pub(super) fn row_text(g: &Grid, y: usize) -> String {
         (0..g.cols).map(|x| g.cell(x, y).c).collect::<String>().trim_end().to_string()
     }
 
@@ -1060,5 +1116,204 @@ mod tests {
         assert!(Grid::new(10, 3).alternate_scroll);
         assert!(!feed(10, 3, &["\x1b[?1007l"]).alternate_scroll);
         assert!(feed(10, 3, &["\x1b[?1007l\x1b[?1007h"]).alternate_scroll);
+    }
+
+    #[test]
+    fn shrinking_moves_the_lost_rows_into_history() {
+        // Splitting a pane shrinks it. Those rows used to be discarded, so
+        // everything above the fold vanished with no way to scroll back.
+        let mut g = feed(20, 5, &["one\r\ntwo\r\nthree\r\nfour\r\nfive"]);
+        assert_eq!(g.scrollback.len(), 0);
+        g.resize(20, 2);
+        assert_eq!(row_text(&g, 0), "four");
+        assert_eq!(row_text(&g, 1), "five");
+        assert_eq!(g.scrollback.len(), 3, "the three rows above must be recoverable");
+        let back: Vec<String> = g
+            .scrollback
+            .iter()
+            .map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect();
+        assert_eq!(back, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn growing_pulls_history_back_instead_of_opening_a_gap() {
+        // Closing a split should undo what opening it did.
+        let mut g = feed(20, 5, &["one\r\ntwo\r\nthree\r\nfour\r\nfive"]);
+        g.resize(20, 2);
+        g.resize(20, 5);
+        let shown: Vec<String> = (0..5).map(|y| row_text(&g, y)).collect();
+        assert_eq!(shown, vec!["one", "two", "three", "four", "five"]);
+        assert_eq!(g.scrollback.len(), 0, "the pulled rows must leave history");
+    }
+
+    #[test]
+    fn growing_past_the_history_leaves_the_gap_at_the_top() {
+        let mut g = feed(20, 2, &["a\r\nb"]);
+        assert_eq!(g.scrollback.len(), 0);
+        g.resize(20, 4);
+        // Nothing to pull, so the blanks belong above the cursor, not below.
+        assert_eq!((0..4).map(|y| row_text(&g, y)).collect::<Vec<_>>(), vec!["", "", "a", "b"]);
+    }
+
+    #[test]
+    fn shrinking_keeps_the_cursor_on_screen() {
+        // The cursor sits on the last used row of a shell. Anchoring purely to
+        // the bottom of the buffer pushed it into history, so a freshly split
+        // pane showed blank rows where the prompt had been.
+        let mut g = feed(20, 5, &["one\r\ntwo\r\nthree"]);
+        assert_eq!((g.cx, g.cy), (5, 2));
+        g.resize(20, 2);
+        assert_eq!(row_text(&g, g.cy), "three", "the cursor left its line");
+        assert_eq!(g.cx, 5);
+        assert!(g.cy < 2);
+    }
+
+    #[test]
+    fn a_resize_round_trip_keeps_the_cursor_on_its_line() {
+        let mut g = feed(20, 5, &["one\r\ntwo\r\nthree"]);
+        g.resize(20, 2);
+        g.resize(20, 5);
+        assert_eq!(row_text(&g, g.cy), "three", "the cursor drifted off its line");
+        assert_eq!(g.cx, 5);
+        // And nothing was lost on the way.
+        let shown: Vec<String> = (0..5).map(|y| row_text(&g, y)).collect();
+        assert!(
+            shown.iter().any(|r| r == "one") && shown.iter().any(|r| r == "two"),
+            "history did not come back: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_alternate_screen_never_feeds_history_on_resize() {
+        // vim and tmux redraw themselves; their frames are not our scrollback.
+        let mut g = feed(20, 4, &["a\r\nb\r\nc"]);
+        let before = g.scrollback.len();
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+            parser.advance(&mut perf, b"x\r\ny\r\nz");
+        }
+        g.resize(20, 2);
+        assert_eq!(g.scrollback.len(), before, "alt-screen rows leaked into history");
+        g.resize(20, 4);
+        assert_eq!(g.scrollback.len(), before);
+    }
+
+    #[test]
+    fn shrinking_respects_the_scrollback_limit() {
+        let mut g = Grid::new(20, 6);
+        g.max_scrollback = 2;
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
+        drop(perf);
+        g.resize(20, 1);
+        assert_eq!(g.scrollback.len(), 2, "history grew past its cap");
+        assert_eq!(g.trimmed, 3, "trimmed rows must stay counted for row ids");
+    }
+
+    #[test]
+    fn shrinking_eats_the_blank_tail_before_touching_history() {
+        // The common case: a pane with a few lines of output and a prompt, then
+        // split. Taking from the top first sent real output to history while
+        // eleven blank rows sat underneath, and the prompt jumped to the top.
+        let mut g = feed(20, 24, &["one\r\ntwo\r\n$ "]);
+        g.resize(20, 12);
+        assert_eq!(g.scrollback.len(), 0, "nothing needed to leave the screen");
+        assert_eq!(
+            (0..4).map(|y| row_text(&g, y)).collect::<Vec<_>>(),
+            vec!["one", "two", "$", ""]
+        );
+        assert_eq!(g.cy, 2, "the cursor stayed on its line");
+    }
+
+    #[test]
+    fn a_full_screen_still_pushes_from_the_top() {
+        // With no blank tail to consume, the old behaviour is the right one.
+        let mut g = feed(20, 5, &["a\r\nb\r\nc\r\nd\r\ne"]);
+        g.resize(20, 2);
+        assert_eq!((0..2).map(|y| row_text(&g, y)).collect::<Vec<_>>(), vec!["d", "e"]);
+        assert_eq!(g.scrollback.len(), 3);
+        assert_eq!(g.cy, 1, "the cursor ends on the new bottom row");
+    }
+
+    #[test]
+    fn the_cursor_survives_any_shrink() {
+        // shrink_from is at most cy + 1 - rows, so the window always contains
+        // the cursor whatever the mix of blank tail and pushed history.
+        for rows_old in 2..12usize {
+            for cy in 0..rows_old {
+                for rows_new in 1..rows_old {
+                    let mut g = Grid::new(8, rows_old);
+                    g.cy = cy;
+                    g.resize(8, rows_new);
+                    assert!(
+                        g.cy < rows_new,
+                        "old={rows_old} cy={cy} new={rows_new} left the cursor at {}",
+                        g.cy
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod split_scenario {
+    use super::tests::row_text;
+    use super::*;
+
+    /// What splitting a pane does to a screenful of shell output: the pane
+    /// halves in height, then the split is closed again.
+    #[test]
+    fn splitting_a_pane_and_closing_it_keeps_every_line() {
+        let mut g = Grid::new(40, 24);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            for i in 1..=20 {
+                parser.advance(&mut perf, format!("line{i}\r\n").as_bytes());
+            }
+            parser.advance(&mut perf, b"$ ");
+        }
+
+        // Split: the pane is now half as tall.
+        g.resize(40, 12);
+        assert_eq!(row_text(&g, g.cy), "$", "the prompt must stay in view");
+
+        // Everything above the fold is reachable by scrolling.
+        let reachable: Vec<String> = (0..g.trimmed + g.scrollback.len() + g.rows)
+            .filter_map(|abs| g.row_at(abs))
+            .map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect();
+        for i in 1..=20 {
+            assert!(reachable.contains(&format!("line{i}")), "line{i} was lost by the split");
+        }
+
+        // Close the split: the pane grows back.
+        g.resize(40, 24);
+        assert_eq!(row_text(&g, g.cy), "$");
+        let shown: Vec<String> = (0..24).map(|y| row_text(&g, y)).collect();
+        for i in 1..=20 {
+            assert!(shown.contains(&format!("line{i}")), "line{i} did not come back: {shown:?}");
+        }
+    }
+
+    /// The same, but narrower as well — splitting left/right changes columns.
+    #[test]
+    fn a_narrower_pane_keeps_its_rows_even_though_they_are_clipped() {
+        let mut g = Grid::new(40, 6);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"a-long-line-of-output-here\r\nsecond\r\n$ ");
+        }
+        g.resize(20, 6);
+        // No reflow, so the tail is clipped — but the line is still there.
+        assert!(row_text(&g, 0).starts_with("a-long-line-of-outpu"));
+        assert_eq!(row_text(&g, 1), "second");
+        assert_eq!(row_text(&g, g.cy), "$");
     }
 }
