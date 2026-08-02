@@ -115,8 +115,9 @@ coverage.
 cargo test
 ```
 
-172 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
-anchoring, stable row ids across trimming, SGR including truecolor, alt
+181 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+anchoring, stable row ids across trimming, resize moving rows to and from
+history, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
 multibyte text, columns after a double-width character, drag direction,
 extraction and padding), paste encoding (bracketed markers, CRLF, defusing
@@ -139,7 +140,8 @@ The GPU path itself is not covered by tests — it needs a display.
 - **Joining wrapped lines on copy.** A command long enough to wrap comes out
   with a newline in the middle, because rows don't record whether they wrapped.
 - **Reflow on resize.** Lines are truncated rather than re-wrapped when the
-  window narrows.
+  window *narrows*. Rows are no longer lost when it shortens — they move to
+  and from the scrollback — but a long line still keeps its old wrapping.
 - **A scrollbar**, or any indicator of where you are in the scrollback.
 - **Ligatures / italic face.** Italic currently renders with the regular face.
 - **Config file.** The theme and font size are compiled in (`theme.rs`,
