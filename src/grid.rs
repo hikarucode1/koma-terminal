@@ -240,16 +240,31 @@ impl Grid {
         };
 
         // No reflow: the surviving window keeps its old wrapping.
-        let mut next = vec![Cell::default(); cols * rows];
         let copy_cols = self.cols.min(cols);
         let src_start = if rows < self.rows { shrink_from } else { 0 };
         let keep = (self.rows - src_start).min(rows - pulled);
         let dst_start = rows - keep;
 
-        for r in 0..keep {
-            for c in 0..copy_cols {
-                next[(dst_start + r) * cols + c] = self.cells[(src_start + r) * self.cols + c];
+        let reshape = |old: &[Cell]| -> Vec<Cell> {
+            let mut next = vec![Cell::default(); cols * rows];
+            for r in 0..keep {
+                for c in 0..copy_cols {
+                    next[(dst_start + r) * cols + c] = old[(src_start + r) * self.cols + c];
+                }
             }
+            next
+        };
+        let mut next = reshape(&self.cells);
+
+        // The alternate screen's stand-in for the main screen has to follow the
+        // same window, or leaving it lands on a buffer of the wrong size — and
+        // the size guard in set_alt_screen would then blank the shell entirely.
+        // Splitting a pane while vim is open used to wipe everything behind it.
+        if let Some((saved, sx, sy)) = self.alt.take() {
+            let reshaped = reshape(&saved);
+            let sx = sx.min(cols - 1);
+            let sy = (sy + dst_start).saturating_sub(src_start).min(rows - 1);
+            self.alt = Some((reshaped, sx, sy));
         }
         // The pulled lines sit directly above what was on screen; if history
         // ran short, the gap is left at the very top.
@@ -1257,6 +1272,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn splitting_while_a_full_screen_program_runs_keeps_the_shell_behind_it() {
+        // Reported in review of #12: resize() left the saved main screen at its
+        // old size, so the size guard in set_alt_screen blanked it on the way
+        // out. Opening vim, splitting the pane, then quitting wiped the shell.
+        let mut g = feed(20, 6, &["shell1\r\nshell2\r\nshell3"]);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+            parser.advance(&mut perf, b"vim-a\r\nvim-b");
+        }
+        g.resize(20, 4);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        assert!(!g.alt_active);
+        let shown: Vec<String> = (0..4).map(|y| row_text(&g, y)).collect();
+        assert_eq!(shown, vec!["shell1", "shell2", "shell3", ""]);
+    }
+
+    #[test]
+    fn the_saved_screen_survives_growing_as_well_as_shrinking() {
+        let mut g = feed(20, 4, &["a\r\nb"]);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 8);
+        g.resize(30, 8);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        let shown: Vec<String> = (0..8).map(|y| row_text(&g, y)).collect();
+        assert!(shown.contains(&"a".to_string()) && shown.contains(&"b".to_string()), "{shown:?}");
+    }
+
+    #[test]
+    fn the_cursor_behind_a_full_screen_program_comes_back_in_range() {
+        let mut g = feed(20, 6, &["one\r\ntwo\r\nthree"]);
+        let (cx, cy) = (g.cx, g.cy);
+        assert_eq!((cx, cy), (5, 2));
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 3);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        assert!(g.cy < 3, "cursor at {} in a 3-row screen", g.cy);
+        assert_eq!(row_text(&g, g.cy), "three", "the cursor left its line");
     }
 }
 
