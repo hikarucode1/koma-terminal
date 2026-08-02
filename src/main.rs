@@ -192,9 +192,10 @@ impl App {
             if cols != p.grid.cols || rows != p.grid.rows {
                 p.grid.resize(cols, rows);
                 p.pty.resize(cols as u16, rows as u16);
-                // resize() drops rows off the top without pushing them to
-                // scrollback, so row ids shift and a live selection would point
-                // at unrelated lines.
+                // Row ids hold across a shrink now, but not across a width
+                // change (columns are truncated) or a grow that outruns the
+                // history, so a live selection can still end up pointing at
+                // something else.
                 if self.selection.is_some_and(|(sid, _)| sid == id) {
                     self.selection = None;
                     self.dragging = false;

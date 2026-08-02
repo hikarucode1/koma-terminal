@@ -103,6 +103,27 @@ pub struct Grid {
     pub alt_active: bool,
 }
 
+/// Moves the top `count` rows of `buf` into `scrollback`, trimming to `max` and
+/// counting whatever is dropped so row ids stay valid.
+fn archive(
+    scrollback: &mut Vec<Vec<Cell>>,
+    trimmed: &mut usize,
+    max: usize,
+    buf: &[Cell],
+    cols: usize,
+    count: usize,
+) {
+    for r in 0..count {
+        let s = r * cols;
+        scrollback.push(buf[s..s + cols].to_vec());
+    }
+    if scrollback.len() > max {
+        let excess = scrollback.len() - max;
+        scrollback.drain(0..excess);
+        *trimmed += excess;
+    }
+}
+
 impl Grid {
     pub fn new(cols: usize, rows: usize) -> Self {
         let cols = cols.max(1);
@@ -197,65 +218,71 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        let (old_rows, old_cols) = (self.rows, self.cols);
+        let copy_cols = old_cols.min(cols);
 
-        // Where the surviving window starts when shrinking.
+        // The window a buffer keeps, as `(src_start, keep, dst_start)`.
         //
-        // Take from below the cursor first — those rows are the unused tail of
-        // the screen — and only push from the top for whatever is still needed.
-        // Doing it the other way round sends real output to history while blank
-        // rows sit underneath, which is what a pane with a few lines of output
-        // and a prompt looks like every time you split it.
-        //
-        // The result always keeps the cursor: `cy + 1 - rows` at most, which is
-        // at most `cy`.
-        let shrink_from = if rows < self.rows {
-            let below = self.rows - 1 - self.cy;
-            (self.rows - rows).saturating_sub(below)
-        } else {
-            0
-        };
-
-        // Rows falling off the top are history, not rubbish. Splitting a pane
-        // shrinks it, and without this everything above the fold vanished with
-        // no way to scroll back to it.
-
-        if rows < self.rows && !self.alt_active {
-            for r in 0..shrink_from {
-                let s = r * self.cols;
-                self.scrollback.push(self.cells[s..s + self.cols].to_vec());
-            }
-            if self.scrollback.len() > self.max_scrollback {
-                let excess = self.scrollback.len() - self.max_scrollback;
-                self.scrollback.drain(0..excess);
-                self.trimmed += excess;
-            }
-        }
-
-        // Growing pulls that history back rather than opening blank space
-        // above the cursor, so closing a split undoes what opening it did.
-        let pulled = if rows > self.rows && !self.alt_active {
-            (rows - self.rows).min(self.scrollback.len())
-        } else {
-            0
+        // Rows below the cursor are the unused tail of the screen, so they go
+        // first; the top is only touched for whatever is still needed. Every
+        // buffer is measured against *its own* cursor — the alternate screen's
+        // saved copy of the main screen has a cursor of its own, usually near
+        // the bottom, and judging it by the cursor of whatever is on screen
+        // would cut it off from the top.
+        let window = |cy: usize, pulled: usize| -> (usize, usize, usize) {
+            let src_start = if rows < old_rows {
+                let below = old_rows - 1 - cy.min(old_rows - 1);
+                (old_rows - rows).saturating_sub(below)
+            } else {
+                0
+            };
+            let keep = (old_rows - src_start).min(rows - pulled);
+            (src_start, keep, rows - keep)
         };
 
         // No reflow: the surviving window keeps its old wrapping.
-        let mut next = vec![Cell::default(); cols * rows];
-        let copy_cols = self.cols.min(cols);
-        let src_start = if rows < self.rows { shrink_from } else { 0 };
-        let keep = (self.rows - src_start).min(rows - pulled);
-        let dst_start = rows - keep;
+        let reshape = |old: &[Cell], (src_start, keep, dst_start): (usize, usize, usize)| {
+            let mut next = vec![Cell::default(); cols * rows];
+            for r in 0..keep {
+                for c in 0..copy_cols {
+                    next[(dst_start + r) * cols + c] = old[(src_start + r) * old_cols + c];
+                }
+            }
+            next
+        };
 
-        for r in 0..keep {
-            for c in 0..copy_cols {
-                next[(dst_start + r) * cols + c] = self.cells[(src_start + r) * self.cols + c];
+        // Exactly one buffer is the main screen — the visible one, or the copy
+        // the alternate screen stands in for — and only that one has a history.
+        let saved = self.alt.take();
+        let main_cy = saved.as_ref().map_or(self.cy, |&(_, _, cy)| cy);
+        let pulled = if rows > old_rows && saved.is_none() {
+            (rows - old_rows).min(self.scrollback.len())
+        } else {
+            0
+        };
+        let main_win = window(main_cy, pulled);
+
+        // Rows falling off the top of the main screen are history, not rubbish.
+        // Splitting a pane shrinks it, and without this everything above the
+        // fold vanished with no way to scroll back to it — including when the
+        // main screen is the one parked behind vim.
+        if rows < old_rows && main_win.0 > 0 {
+            let max = self.max_scrollback;
+            let (scrollback, trimmed) = (&mut self.scrollback, &mut self.trimmed);
+            match saved.as_ref() {
+                Some((buf, _, _)) => archive(scrollback, trimmed, max, buf, old_cols, main_win.0),
+                None => archive(scrollback, trimmed, max, &self.cells, old_cols, main_win.0),
             }
         }
-        // The pulled lines sit directly above what was on screen; if history
-        // ran short, the gap is left at the very top.
+
+        let visible_win = if saved.is_some() { window(self.cy, 0) } else { main_win };
+        let mut next = reshape(&self.cells, visible_win);
+
+        // Growing pulls that history back rather than opening blank space above
+        // the cursor, so closing a split undoes what opening it did.
         for i in 0..pulled {
             let row = &self.scrollback[self.scrollback.len() - pulled + i];
-            let dst = (dst_start - pulled + i) * cols;
+            let dst = (main_win.2 - pulled + i) * cols;
             let n = copy_cols.min(row.len());
             next[dst..dst + n].copy_from_slice(&row[..n]);
         }
@@ -264,9 +291,15 @@ impl Grid {
             self.scrollback.truncate(keep_back);
         }
 
+        if let Some((buf, sx, sy)) = saved {
+            let reshaped = reshape(&buf, main_win);
+            let ny = (sy + main_win.2).saturating_sub(main_win.0).min(rows - 1);
+            self.alt = Some((reshaped, sx.min(cols - 1), ny));
+        }
+
         self.cells = next;
         self.cx = self.cx.min(cols - 1);
-        self.cy = (self.cy + dst_start).saturating_sub(src_start).min(rows - 1);
+        self.cy = (self.cy + visible_win.2).saturating_sub(visible_win.0).min(rows - 1);
         self.cols = cols;
         self.rows = rows;
         self.top = 0;
@@ -1185,10 +1218,11 @@ mod tests {
     }
 
     #[test]
-    fn the_alternate_screen_never_feeds_history_on_resize() {
+    fn a_full_screen_programs_own_rows_never_reach_history() {
         // vim and tmux redraw themselves; their frames are not our scrollback.
+        // What the main screen behind them loses off the top still is, which is
+        // why this checks whose rows arrived rather than merely counting them.
         let mut g = feed(20, 4, &["a\r\nb\r\nc"]);
-        let before = g.scrollback.len();
         let mut parser = vte::Parser::new();
         {
             let mut perf = Performer { grid: &mut g, reply: Vec::new() };
@@ -1196,9 +1230,15 @@ mod tests {
             parser.advance(&mut perf, b"x\r\ny\r\nz");
         }
         g.resize(20, 2);
-        assert_eq!(g.scrollback.len(), before, "alt-screen rows leaked into history");
         g.resize(20, 4);
-        assert_eq!(g.scrollback.len(), before);
+        let history: Vec<String> = g
+            .scrollback
+            .iter()
+            .map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect();
+        for frame in ["x", "y", "z"] {
+            assert!(!history.contains(&frame.to_string()), "{frame:?} leaked into {history:?}");
+        }
     }
 
     #[test]
@@ -1257,6 +1297,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn splitting_while_a_full_screen_program_runs_keeps_the_shell_behind_it() {
+        // Reported in review of #12: resize() left the saved main screen at its
+        // old size, so the size guard in set_alt_screen blanked it on the way
+        // out. Opening vim, splitting the pane, then quitting wiped the shell.
+        let mut g = feed(20, 6, &["shell1\r\nshell2\r\nshell3"]);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+            parser.advance(&mut perf, b"vim-a\r\nvim-b");
+        }
+        g.resize(20, 4);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        assert!(!g.alt_active);
+        let shown: Vec<String> = (0..4).map(|y| row_text(&g, y)).collect();
+        assert_eq!(shown, vec!["shell1", "shell2", "shell3", ""]);
+    }
+
+    #[test]
+    fn the_saved_screen_survives_growing_as_well_as_shrinking() {
+        let mut g = feed(20, 4, &["a\r\nb"]);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 8);
+        g.resize(30, 8);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        let shown: Vec<String> = (0..8).map(|y| row_text(&g, y)).collect();
+        assert!(shown.contains(&"a".to_string()) && shown.contains(&"b".to_string()), "{shown:?}");
+    }
+
+    #[test]
+    fn the_cursor_behind_a_full_screen_program_comes_back_in_range() {
+        let mut g = feed(20, 6, &["one\r\ntwo\r\nthree"]);
+        let (cx, cy) = (g.cx, g.cy);
+        assert_eq!((cx, cy), (5, 2));
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 3);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        assert!(g.cy < 3, "cursor at {} in a 3-row screen", g.cy);
+        assert_eq!(row_text(&g, g.cy), "three", "the cursor left its line");
+    }
+
+    #[test]
+    fn a_full_shell_screen_behind_vim_survives_a_split_intact() {
+        // Reported in review of #13: the saved main screen was cut to a window
+        // measured against *vim's* cursor, which sits at the top. The shell's
+        // own cursor is at the bottom, so its screen lost the prompt and the
+        // eleven rows above it — and they were not in the scrollback either.
+        let mut g = Grid::new(20, 24);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            for i in 1..=23 {
+                parser.advance(&mut perf, format!("l{i}\r\n").as_bytes());
+            }
+            parser.advance(&mut perf, b"$ ");
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 12);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+
+        assert_eq!(row_text(&g, g.cy), "$", "the prompt must come back with the shell");
+        assert_eq!(
+            (0..12).map(|y| row_text(&g, y)).collect::<Vec<_>>(),
+            (13..=23).map(|i| format!("l{i}")).chain(["$".to_string()]).collect::<Vec<_>>()
+        );
+
+        // And nothing went missing on the way: every line is still reachable.
+        let reachable: Vec<String> = (0..g.trimmed + g.scrollback.len() + g.rows)
+            .filter_map(|abs| g.row_at(abs))
+            .map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect();
+        for i in 1..=23 {
+            assert!(reachable.contains(&format!("l{i}")), "l{i} was lost behind vim");
+        }
+    }
+
+    #[test]
+    fn a_split_behind_vim_matches_a_split_without_it() {
+        // The invariant #12 established must not lapse just because a
+        // full-screen program happens to be in front.
+        let build = || {
+            let mut g = Grid::new(20, 24);
+            let mut parser = vte::Parser::new();
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            for i in 1..=23 {
+                parser.advance(&mut perf, format!("l{i}\r\n").as_bytes());
+            }
+            parser.advance(&mut perf, b"$ ");
+            drop(perf);
+            g
+        };
+
+        let mut plain = build();
+        plain.resize(20, 12);
+
+        let mut behind = build();
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut behind, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        behind.resize(20, 12);
+        {
+            let mut perf = Performer { grid: &mut behind, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+
+        assert_eq!(
+            (0..12).map(|y| row_text(&behind, y)).collect::<Vec<_>>(),
+            (0..12).map(|y| row_text(&plain, y)).collect::<Vec<_>>(),
+        );
+        assert_eq!(behind.scrollback.len(), plain.scrollback.len());
+        assert_eq!(behind.cy, plain.cy);
     }
 }
 
