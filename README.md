@@ -56,6 +56,11 @@ viewport and never the program, which is what you want inside tmux: there the
 arrow keys reach a shell's line editor and get read as history navigation
 rather than scrolling.
 
+What Shift+wheel shows you inside a full-screen program is *our* scrollback:
+whatever was on screen before that program started. tmux keeps its own
+history and koma cannot see it, so scrolling back through a tmux session
+needs tmux's copy mode (`prefix + [`) until mouse reporting lands here.
+
 Everything else is encoded and forwarded to the shell.
 
 ## Japanese and other IME input
@@ -104,7 +109,7 @@ coverage.
 cargo test
 ```
 
-151 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+156 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
 multibyte text, columns after a double-width character, drag direction,
@@ -113,11 +118,11 @@ escape sequences, and an end marker that a single removal pass would splice
 back together), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
-accumulation, alternate-scroll encoding, IME composition layout (wrapping, kana
-taking two columns, active-segment byte ranges, caret tracking, and which pane a
-composition commits into), font rasterisation and the atlas, and real pty
-behaviour (a shell's output round-tripping, `stty size` seeing the right
-dimensions, EOF on exit).
+accumulation, wheel axis selection, alternate-scroll encoding, IME
+composition layout (wrapping, kana taking two columns, active-segment byte
+ranges, caret tracking, and which pane a composition commits into), font
+rasterisation and the atlas, and real pty behaviour (a shell's output
+round-tripping, `stty size` seeing the right dimensions, EOF on exit).
 
 The GPU path itself is not covered by tests — it needs a display.
 
