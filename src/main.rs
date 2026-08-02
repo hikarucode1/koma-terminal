@@ -100,6 +100,8 @@ struct App {
     /// belongs to.
     scroll_accum: f32,
     wheel_target: PaneId,
+    /// Whether the last wheel event was read off the horizontal axis.
+    wheel_across: bool,
     /// Text the IME is composing for the focused pane, if any.
     preedit: Preedit,
     /// Selection in progress or finished, and the pane it belongs to.
@@ -132,6 +134,7 @@ impl App {
             font_pt: DEFAULT_FONT_PT,
             scroll_accum: 0.0,
             wheel_target: 0,
+            wheel_across: false,
             preedit: Preedit::default(),
             selection: None,
             dragging: false,
@@ -1088,6 +1091,11 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 /// application arrives on x. Reading only y made Shift+wheel do nothing at all.
 /// There is no horizontal scrolling here, so under Shift take whichever axis
 /// actually moved.
+///
+/// Not gated on the platform, though only macOS swaps: keeping it a plain
+/// function of its arguments is what makes it testable, and the cost elsewhere
+/// is that a Shift+horizontal swipe scrolls vertically instead of doing
+/// nothing at all.
 fn wheel_lines(across: f32, down: f32, shift: bool) -> f32 {
     if shift && across.abs() > down.abs() { across } else { down }
 }
@@ -1451,24 +1459,36 @@ impl ApplicationHandler<UserEvent> for App {
                 // Positive means "reveal content above", i.e. go back in history.
                 let (across, down) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x * 3.0, y * 3.0),
+                    // `ch`, not `cw`: under Shift the x axis is carrying
+                    // vertical movement, so the vertical cell size converts it.
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32 / ch, p.y as f32 / ch),
                 };
                 let shift = self.mods.shift_key();
                 let lines = wheel_lines(across, down, shift);
-                log::debug!(
-                    "wheel: across={across:.2} down={down:.2} shift={shift} -> {lines:.2} lines"
-                );
                 // Scroll whatever is under the pointer, not just the focused pane.
                 let target =
                     self.pane_at(self.cursor_pos.0, self.cursor_pos.1).unwrap_or(self.focus);
-                if target != self.wheel_target {
+                // Leftover fractions belong to the pane and the axis they came
+                // from; carrying them across either would apply the remainder
+                // of one gesture to a different one.
+                let across_axis = lines == across && across != down;
+                if target != self.wheel_target || across_axis != self.wheel_across {
                     self.wheel_target = target;
+                    self.wheel_across = across_axis;
                     self.scroll_accum = 0.0;
                 }
                 // A trackpad reports a few pixels per event — well under one
                 // row — so the remainder has to carry over between events or
                 // every scroll rounds away to nothing.
                 let whole = take_whole_lines(&mut self.scroll_accum, lines);
+                // Logged after the accumulator, so "the axis was read but
+                // nothing moved" can be told from "the fraction hasn't added up
+                // to a line yet" without another round trip to real hardware.
+                let back = self.panes.get(&target).map(|p| p.grid.scrollback.len()).unwrap_or(0);
+                log::debug!(
+                    "wheel: across={across:.2} down={down:.2} shift={shift} \
+                     -> {lines:.2} lines, whole={whole}, scrollback={back}"
+                );
                 if whole != 0 {
                     self.wheel_scroll(target, whole, shift);
                     self.request_redraw();
