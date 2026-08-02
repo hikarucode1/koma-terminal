@@ -115,7 +115,7 @@ coverage.
 cargo test
 ```
 
-181 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+184 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, resize moving rows to and from
 history, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
@@ -142,6 +142,10 @@ The GPU path itself is not covered by tests — it needs a display.
 - **Reflow on resize.** Lines are truncated rather than re-wrapped when the
   window *narrows*. Rows are no longer lost when it shortens — they move to
   and from the scrollback — but a long line still keeps its old wrapping.
+- **Rows below the cursor are dropped when a pane shrinks**, rather than
+  archived. Sending them to the scrollback would put them out of order, so
+  every terminal discards them; it only shows up when the cursor is high on
+  the screen, as with a progress display that moves back up.
 - **A scrollbar**, or any indicator of where you are in the scrollback.
 - **Ligatures / italic face.** Italic currently renders with the regular face.
 - **Config file.** The theme and font size are compiled in (`theme.rs`,

@@ -198,14 +198,26 @@ impl Grid {
             return;
         }
 
+        // Where the surviving window starts when shrinking.
+        //
+        // Take from below the cursor first — those rows are the unused tail of
+        // the screen — and only push from the top for whatever is still needed.
+        // Doing it the other way round sends real output to history while blank
+        // rows sit underneath, which is what a pane with a few lines of output
+        // and a prompt looks like every time you split it.
+        //
+        // The result always keeps the cursor: `cy + 1 - rows` at most, which is
+        // at most `cy`.
+        let shrink_from = if rows < self.rows {
+            let below = self.rows - 1 - self.cy;
+            (self.rows - rows).saturating_sub(below)
+        } else {
+            0
+        };
+
         // Rows falling off the top are history, not rubbish. Splitting a pane
         // shrinks it, and without this everything above the fold vanished with
         // no way to scroll back to it.
-        // Where the surviving window starts. Bottom-anchored, but never so far
-        // down that the cursor is left above it: a shell's cursor sits on the
-        // last used row, and pushing it into history shows blank rows where the
-        // prompt was.
-        let shrink_from = if rows < self.rows { (self.rows - rows).min(self.cy) } else { 0 };
 
         if rows < self.rows && !self.alt_active {
             for r in 0..shrink_from {
@@ -1200,6 +1212,51 @@ mod tests {
         g.resize(20, 1);
         assert_eq!(g.scrollback.len(), 2, "history grew past its cap");
         assert_eq!(g.trimmed, 3, "trimmed rows must stay counted for row ids");
+    }
+
+    #[test]
+    fn shrinking_eats_the_blank_tail_before_touching_history() {
+        // The common case: a pane with a few lines of output and a prompt, then
+        // split. Taking from the top first sent real output to history while
+        // eleven blank rows sat underneath, and the prompt jumped to the top.
+        let mut g = feed(20, 24, &["one\r\ntwo\r\n$ "]);
+        g.resize(20, 12);
+        assert_eq!(g.scrollback.len(), 0, "nothing needed to leave the screen");
+        assert_eq!(
+            (0..4).map(|y| row_text(&g, y)).collect::<Vec<_>>(),
+            vec!["one", "two", "$", ""]
+        );
+        assert_eq!(g.cy, 2, "the cursor stayed on its line");
+    }
+
+    #[test]
+    fn a_full_screen_still_pushes_from_the_top() {
+        // With no blank tail to consume, the old behaviour is the right one.
+        let mut g = feed(20, 5, &["a\r\nb\r\nc\r\nd\r\ne"]);
+        g.resize(20, 2);
+        assert_eq!((0..2).map(|y| row_text(&g, y)).collect::<Vec<_>>(), vec!["d", "e"]);
+        assert_eq!(g.scrollback.len(), 3);
+        assert_eq!(g.cy, 1, "the cursor ends on the new bottom row");
+    }
+
+    #[test]
+    fn the_cursor_survives_any_shrink() {
+        // shrink_from is at most cy + 1 - rows, so the window always contains
+        // the cursor whatever the mix of blank tail and pushed history.
+        for rows_old in 2..12usize {
+            for cy in 0..rows_old {
+                for rows_new in 1..rows_old {
+                    let mut g = Grid::new(8, rows_old);
+                    g.cy = cy;
+                    g.resize(8, rows_new);
+                    assert!(
+                        g.cy < rows_new,
+                        "old={rows_old} cy={cy} new={rows_new} left the cursor at {}",
+                        g.cy
+                    );
+                }
+            }
+        }
     }
 }
 
