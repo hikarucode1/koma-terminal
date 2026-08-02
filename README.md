@@ -57,9 +57,14 @@ arrow keys reach a shell's line editor and get read as history navigation
 rather than scrolling.
 
 What Shift+wheel shows you inside a full-screen program is *our* scrollback:
-whatever was on screen before that program started. tmux keeps its own
-history and koma cannot see it, so scrolling back through a tmux session
-needs tmux's copy mode (`prefix + [`) until mouse reporting lands here.
+whatever was on screen before that program started. Over ssh into a tmux
+session that is almost nothing, since tmux keeps its own history and koma
+cannot see it.
+
+For that, mouse reporting is the answer: with `set -g mouse on`, tmux
+receives the wheel itself and scrolls its own history in copy mode. Shift
+still keeps any event local, which is how you select text or reach our
+scrollback while a program owns the pointer.
 
 Everything else is encoded and forwarded to the shell.
 
@@ -81,6 +86,7 @@ handling of `Ime::Preedit`/`Ime::Commit`; during composition winit suppresses
 main.rs    winit event loop, pane bookkeeping, frame building
  ├ pane.rs  n-ary split tree -> pane rects (the tiling)
  ├ selection.rs  selection ranges, word snapping, text extraction
+ ├ mouse.rs  mouse reporting: tracking modes and SGR/legacy encoding
  ├ pty.rs   spawns $SHELL on a pty; a reader thread wakes the event loop
  ├ grid.rs  cell grid + scrollback + the vte::Perform that mutates it
  ├ font.rs  font lookup (fontdb), rasterising (swash), shelf-packed atlas
@@ -109,7 +115,7 @@ coverage.
 cargo test
 ```
 
-156 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+172 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
 multibyte text, columns after a double-width character, drag direction,
@@ -118,7 +124,9 @@ escape sequences, and an end marker that a single removal pass would splice
 back together), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
-accumulation, wheel axis selection, alternate-scroll encoding, IME
+accumulation, wheel axis selection, alternate-scroll encoding, mouse
+reporting (SGR and legacy encodings, which events each tracking mode wants,
+the legacy column ceiling), IME
 composition layout (wrapping, kana taking two columns, active-segment byte
 ranges, caret tracking, and which pane a composition commits into), font
 rasterisation and the atlas, and real pty behaviour (a shell's output
@@ -133,7 +141,6 @@ The GPU path itself is not covered by tests — it needs a display.
 - **Reflow on resize.** Lines are truncated rather than re-wrapped when the
   window narrows.
 - **A scrollbar**, or any indicator of where you are in the scrollback.
-- **Mouse reporting to the shell**, so vim/tmux can see clicks.
 - **Ligatures / italic face.** Italic currently renders with the regular face.
 - **Config file.** The theme and font size are compiled in (`theme.rs`,
   `DEFAULT_FONT_PT`).

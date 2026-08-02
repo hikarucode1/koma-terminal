@@ -3,6 +3,8 @@
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::mouse::{Encoding as MouseEncoding, Tracking as MouseTracking};
+
 pub const FLAG_BOLD: u8 = 1 << 0;
 pub const FLAG_ITALIC: u8 = 1 << 1;
 pub const FLAG_UNDERLINE: u8 = 1 << 2;
@@ -88,6 +90,14 @@ pub struct Grid {
     /// Bracketed paste (DECSET 2004). When the program asks for it, pasted
     /// text is wrapped in markers so it can tell a paste from typing.
     pub bracketed_paste: bool,
+    /// Which mouse events the program wants (DECSET 1000/1002/1003).
+    pub mouse_tracking: MouseTracking,
+    /// How to spell them (DECSET 1006).
+    pub mouse_encoding: MouseEncoding,
+    /// Alternate scroll (DECSET 1007): may the wheel be turned into arrow keys
+    /// on the alternate screen? On by default, which is what less and man
+    /// expect; tmux turns it off once it handles the mouse itself.
+    pub alternate_scroll: bool,
     /// Alternate screen buffer, saved main screen while active.
     alt: Option<(Vec<Cell>, usize, usize)>,
     pub alt_active: bool,
@@ -120,6 +130,9 @@ impl Grid {
             bell: false,
             app_cursor_keys: false,
             bracketed_paste: false,
+            mouse_tracking: MouseTracking::Off,
+            mouse_encoding: MouseEncoding::Legacy,
+            alternate_scroll: true,
             alt: None,
             alt_active: false,
         }
@@ -331,6 +344,25 @@ impl Grid {
                 (true, 1) => self.app_cursor_keys = enable,
                 (true, 25) => self.cursor_visible = enable,
                 (true, 2004) => self.bracketed_paste = enable,
+                // Any of these turning off means "stop tracking"; xterm has no
+                // notion of falling back to a lesser mode.
+                (true, 1000) => {
+                    self.mouse_tracking =
+                        if enable { MouseTracking::Normal } else { MouseTracking::Off }
+                }
+                (true, 1002) => {
+                    self.mouse_tracking =
+                        if enable { MouseTracking::ButtonEvent } else { MouseTracking::Off }
+                }
+                (true, 1003) => {
+                    self.mouse_tracking =
+                        if enable { MouseTracking::AnyEvent } else { MouseTracking::Off }
+                }
+                (true, 1006) => {
+                    self.mouse_encoding =
+                        if enable { MouseEncoding::Sgr } else { MouseEncoding::Legacy }
+                }
+                (true, 1007) => self.alternate_scroll = enable,
                 (true, 1049) | (true, 1047) | (true, 47) => self.set_alt_screen(enable),
                 _ => {}
             }
@@ -985,5 +1017,48 @@ mod tests {
         assert!(!Grid::new(10, 3).bracketed_paste, "off until the program asks");
         assert!(feed(10, 3, &["\x1b[?2004h"]).bracketed_paste);
         assert!(!feed(10, 3, &["\x1b[?2004h\x1b[?2004l"]).bracketed_paste);
+    }
+
+    #[test]
+    fn decset_selects_a_mouse_tracking_mode() {
+        assert_eq!(Grid::new(10, 3).mouse_tracking, MouseTracking::Off);
+        assert_eq!(feed(10, 3, &["\x1b[?1000h"]).mouse_tracking, MouseTracking::Normal);
+        assert_eq!(feed(10, 3, &["\x1b[?1002h"]).mouse_tracking, MouseTracking::ButtonEvent);
+        assert_eq!(feed(10, 3, &["\x1b[?1003h"]).mouse_tracking, MouseTracking::AnyEvent);
+    }
+
+    #[test]
+    fn turning_a_mouse_mode_off_stops_tracking_entirely() {
+        // There is no falling back to a lesser mode; tmux relies on this when
+        // it hands the mouse back.
+        let g = feed(10, 3, &["\x1b[?1002h\x1b[?1002l"]);
+        assert_eq!(g.mouse_tracking, MouseTracking::Off);
+        let g = feed(10, 3, &["\x1b[?1003h\x1b[?1000l"]);
+        assert_eq!(g.mouse_tracking, MouseTracking::Off);
+    }
+
+    #[test]
+    fn decset_1006_switches_to_sgr_encoding() {
+        assert_eq!(Grid::new(10, 3).mouse_encoding, MouseEncoding::Legacy);
+        assert_eq!(feed(10, 3, &["\x1b[?1006h"]).mouse_encoding, MouseEncoding::Sgr);
+        assert_eq!(feed(10, 3, &["\x1b[?1006h\x1b[?1006l"]).mouse_encoding, MouseEncoding::Legacy);
+    }
+
+    #[test]
+    fn tmux_style_startup_leaves_the_mouse_fully_configured() {
+        // What tmux actually sends for `set -g mouse on`.
+        let g = feed(10, 3, &["\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h"]);
+        assert!(g.alt_active);
+        assert_eq!(g.mouse_tracking, MouseTracking::ButtonEvent);
+        assert_eq!(g.mouse_encoding, MouseEncoding::Sgr);
+    }
+
+    #[test]
+    fn alternate_scroll_is_on_until_a_program_declines_it() {
+        // less and man expect the wheel to become arrows; a program that
+        // handles the mouse itself turns this off.
+        assert!(Grid::new(10, 3).alternate_scroll);
+        assert!(!feed(10, 3, &["\x1b[?1007l"]).alternate_scroll);
+        assert!(feed(10, 3, &["\x1b[?1007l\x1b[?1007h"]).alternate_scroll);
     }
 }
