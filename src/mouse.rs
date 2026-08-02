@@ -54,9 +54,11 @@ pub struct Mods {
     pub ctrl: bool,
 }
 
-/// The largest coordinate the legacy encoding can express: one byte, biased by
-/// 32, and 255 is the ceiling.
-const LEGACY_MAX: usize = 223;
+/// The largest coordinate the legacy encoding can express. One byte biased by
+/// 32 tops out at 223 *on the wire*, and the wire counts from one — so the
+/// largest we can accept, counting from zero, is 222. Off by one here and
+/// column 223 encodes as 256, which truncates to NUL.
+const LEGACY_MAX: usize = 222;
 
 fn button_bits(b: Button) -> u16 {
     match b {
@@ -190,10 +192,18 @@ mod tests {
 
     #[test]
     fn modifiers_add_their_bits() {
-        let m = Mods { shift: true, alt: false, ctrl: true };
+        // Ctrl and Alt are the ones a program can actually see: koma keeps
+        // Shift for itself, so a report never carries that bit in practice.
+        let m = Mods { shift: false, alt: true, ctrl: true };
         let out = encode(Tracking::Normal, Encoding::Sgr, Event::Press(Button::Left), 0, 0, m);
-        // 0 (left) + 4 (shift) + 16 (ctrl)
-        assert_eq!(String::from_utf8(out.unwrap()).unwrap(), "\x1b[<20;1;1M");
+        // 0 (left) + 8 (alt) + 16 (ctrl)
+        assert_eq!(String::from_utf8(out.unwrap()).unwrap(), "\x1b[<24;1;1M");
+
+        // The encoder is general even so, since the bit is part of the format.
+        let shifted = Mods { shift: true, alt: false, ctrl: false };
+        let out =
+            encode(Tracking::Normal, Encoding::Sgr, Event::Press(Button::Left), 0, 0, shifted);
+        assert_eq!(String::from_utf8(out.unwrap()).unwrap(), "\x1b[<4;1;1M");
     }
 
     #[test]
@@ -252,11 +262,26 @@ mod tests {
     fn legacy_stays_silent_rather_than_reporting_a_wrong_column() {
         let m = Mods::default();
         let press = Event::Press(Button::Left);
-        assert!(encode(Tracking::Normal, Encoding::Legacy, press, 222, 0, m).is_some());
-        assert!(
-            encode(Tracking::Normal, Encoding::Legacy, press, 224, 0, m).is_none(),
-            "past the one-byte ceiling it must send nothing"
-        );
+        let at = |col, row| encode(Tracking::Normal, Encoding::Legacy, press, col, row, m);
+
+        // 222 counting from zero is 223 on the wire: the last byte that fits.
+        assert_eq!(at(222, 0).unwrap()[4], 255);
+        // 223 used to encode as 256 and truncate to NUL, which is worse than a
+        // wrong number — a NUL can terminate the sequence at the far end.
+        assert!(at(223, 0).is_none(), "the column past the ceiling must send nothing");
+        assert!(at(224, 0).is_none());
+        // Rows have the same ceiling and the same failure.
+        assert_eq!(at(0, 222).unwrap()[5], 255);
+        assert!(at(0, 223).is_none());
+
+        // No byte of any accepted report may be NUL.
+        for col in 0..=222 {
+            for row in [0usize, 100, 222] {
+                let out = at(col, row).unwrap();
+                assert!(!out.contains(&0), "col={col} row={row} produced {out:?}");
+            }
+        }
+
         // SGR has no such limit, which is why programs ask for it.
         assert!(encode(Tracking::Normal, Encoding::Sgr, press, 5000, 0, m).is_some());
     }

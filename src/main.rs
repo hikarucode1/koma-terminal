@@ -110,9 +110,10 @@ struct App {
     selection: Option<(PaneId, Selection)>,
     /// True while the left button is down, so motion extends the selection.
     dragging: bool,
-    /// True while a press has been handed to the program instead, so the
-    /// matching release and any motion go the same way.
-    reporting_drag: bool,
+    /// Set while a press has been handed to a program instead of starting a
+    /// selection. Holds the pane it went to, so the motion and release that
+    /// follow reach the same program even if the pointer wanders off it.
+    reporting_drag: Option<PaneId>,
     /// Last left-press, for turning repeats into word and line selection.
     last_click: Option<(Instant, PaneId, usize, usize)>,
     click_streak: u32,
@@ -143,7 +144,7 @@ impl App {
             preedit: Preedit::default(),
             selection: None,
             dragging: false,
-            reporting_drag: false,
+            reporting_drag: None,
             last_click: None,
             click_streak: 0,
             clipboard: None,
@@ -678,6 +679,19 @@ impl App {
         Some((id, x, y))
     }
 
+    /// Screen position within a specific pane, clamped to it — the reporting
+    /// counterpart of `drag_cell`.
+    fn pane_local_cell(&self, px: f32, py: f32, id: PaneId) -> Option<(usize, usize)> {
+        let (cw, ch) = self.cell_size();
+        let p = self.panes.get(&id)?;
+        let rect = p.rect;
+        let cols = ((rect.w / cw).floor().max(1.0) as usize).min(p.grid.cols);
+        let rows = ((rect.h / ch).floor().max(1.0) as usize).min(p.grid.rows);
+        let x = (((px - rect.x) / cw).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+        let y = (((py - rect.y) / ch).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        Some((x, y))
+    }
+
     fn mouse_mods(&self) -> MouseMods {
         MouseMods {
             shift: self.mods.shift_key(),
@@ -692,10 +706,24 @@ impl App {
     /// terminal follows, and it is the only way to select text or reach our own
     /// scrollback once a program has taken the mouse.
     fn report_mouse(&mut self, px: f32, py: f32, event: MouseEv) -> bool {
+        self.report_mouse_to(None, px, py, event)
+    }
+
+    /// As `report_mouse`, but pinned to `owner` when a drag is already in
+    /// flight: the program that saw the press must see the release, even if the
+    /// pointer has since left its pane or the window entirely.
+    fn report_mouse_to(&mut self, owner: Option<PaneId>, px: f32, py: f32, event: MouseEv) -> bool {
         if self.mods.shift_key() {
             return false;
         }
-        let Some((id, col, row)) = self.report_cell(px, py) else { return false };
+        let resolved = match owner {
+            Some(id) => self.drag_cell(px, py, id).map(|(_, _)| id).and_then(|id| {
+                let (col, row) = self.pane_local_cell(px, py, id)?;
+                Some((id, col, row))
+            }),
+            None => self.report_cell(px, py),
+        };
+        let Some((id, col, row)) = resolved else { return false };
         let mods = self.mouse_mods();
         let Some(p) = self.panes.get_mut(&id) else { return false };
         let Some(bytes) =
@@ -1177,8 +1205,11 @@ enum WheelAction {
 /// the program. Without it, scrolling inside tmux — or at any shell prompt on
 /// the alternate screen — replays arrow keys into the command line instead of
 /// scrolling, which is what the arrows mean to a line editor.
-fn wheel_action(shift: bool, alt_screen: bool) -> WheelAction {
-    if shift || !alt_screen { WheelAction::Viewport } else { WheelAction::Application }
+///
+/// `arrows_allowed` is the alternate screen *and* DECSET 1007 still set: a
+/// program that handles the mouse itself turns 1007 off to decline them.
+fn wheel_action(shift: bool, arrows_allowed: bool) -> WheelAction {
+    if shift || !arrows_allowed { WheelAction::Viewport } else { WheelAction::Application }
 }
 
 /// Arrow keys an application should see for `lines` of wheel scrolling on the
@@ -1492,8 +1523,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
-                let held = self.reporting_drag.then_some(MouseBtn::Left);
-                self.report_mouse(px, py, MouseEv::Motion(held));
+                // Check this before report_cell, which walks the pane tree and
+                // allocates: tracking is off for every ordinary shell, and the
+                // pointer moves constantly.
+                let owner = self.reporting_drag;
+                let listening = self
+                    .panes
+                    .get(&owner.unwrap_or(self.focus))
+                    .is_some_and(|p| p.grid.mouse_tracking != mouse::Tracking::Off);
+                if !listening {
+                    return;
+                }
+                let held = owner.map(|_| MouseBtn::Left);
+                self.report_mouse_to(owner, px, py, MouseEv::Motion(held));
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1520,7 +1562,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         if self.report_mouse(px, py, MouseEv::Press(MouseBtn::Left)) {
-                            self.reporting_drag = true;
+                            self.reporting_drag = self.report_cell(px, py).map(|(id, _, _)| id);
+                            // The program owns the pointer now; a stale
+                            // highlight would just sit there.
+                            self.selection = None;
                             self.request_redraw();
                             return;
                         }
@@ -1528,9 +1573,13 @@ impl ApplicationHandler<UserEvent> for App {
                         self.request_redraw();
                     }
                     ElementState::Released => {
-                        if self.reporting_drag {
-                            self.reporting_drag = false;
-                            self.report_mouse(px, py, MouseEv::Release(MouseBtn::Left));
+                        if let Some(owner) = self.reporting_drag.take() {
+                            self.report_mouse_to(
+                                Some(owner),
+                                px,
+                                py,
+                                MouseEv::Release(MouseBtn::Left),
+                            );
                             return;
                         }
                         self.dragging = false;
@@ -1582,6 +1631,11 @@ impl ApplicationHandler<UserEvent> for App {
                     // A program that took the mouse gets the wheel too — that
                     // is how `set -g mouse on` reaches tmux's copy mode, which
                     // is the only way to scroll history we never see.
+                    //
+                    // `sent` is what actually prevents double-sending: once a
+                    // report goes out we don't also synthesise arrows. DECSET
+                    // 1007 is a second, weaker gate — whether a program bothers
+                    // to send it depends on its terminfo.
                     let up = whole > 0;
                     let mut sent = 0;
                     for _ in 0..whole.unsigned_abs().min(WHEEL_REPORT_CAP) {
