@@ -7,6 +7,7 @@ mod font;
 mod gpu;
 mod grid;
 mod input;
+mod mouse;
 mod pane;
 mod pty;
 mod selection;
@@ -30,6 +31,7 @@ use gpu::{FrameStatus, Gpu, Inst};
 use grid::{
     Cell, Color, CursorShape, FLAG_BOLD, FLAG_INVERSE, FLAG_UNDERLINE, FLAG_WIDE_SPACER, Grid,
 };
+use mouse::{Button as MouseBtn, Event as MouseEv, Mods as MouseMods};
 use pane::{Axis, Node, PaneId, Rect};
 use pty::Pty;
 use selection::{Mode as SelMode, Point, Selection};
@@ -108,6 +110,9 @@ struct App {
     selection: Option<(PaneId, Selection)>,
     /// True while the left button is down, so motion extends the selection.
     dragging: bool,
+    /// True while a press has been handed to the program instead, so the
+    /// matching release and any motion go the same way.
+    reporting_drag: bool,
     /// Last left-press, for turning repeats into word and line selection.
     last_click: Option<(Instant, PaneId, usize, usize)>,
     click_streak: u32,
@@ -138,6 +143,7 @@ impl App {
             preedit: Preedit::default(),
             selection: None,
             dragging: false,
+            reporting_drag: false,
             last_click: None,
             click_streak: 0,
             clipboard: None,
@@ -487,8 +493,11 @@ impl App {
         if lines == 0 {
             return;
         }
-        let alt = self.panes.get(&id).is_some_and(|p| p.grid.alt_active);
-        if wheel_action(shift, alt) == WheelAction::Viewport {
+        // 1007 off means the program has said not to synthesise arrows, which
+        // is what tmux does once it handles the mouse itself.
+        let arrows_allowed =
+            self.panes.get(&id).is_some_and(|p| p.grid.alt_active && p.grid.alternate_scroll);
+        if wheel_action(shift, arrows_allowed) == WheelAction::Viewport {
             self.scroll_pane(id, lines);
             return;
         }
@@ -654,6 +663,48 @@ impl App {
                 (Point::new(abs, 0), Point::new(abs, cols))
             }
         }
+    }
+
+    /// Screen position of the pointer inside a pane, as `(pane, col, row)`.
+    /// Rows are viewport rows: what the program drew is what the user clicked.
+    fn report_cell(&self, px: f32, py: f32) -> Option<(PaneId, usize, usize)> {
+        let (cw, ch) = self.cell_size();
+        let (id, rect) = self.layout().into_iter().find(|(_, r)| r.contains(px, py))?;
+        let p = self.panes.get(&id)?;
+        let cols = ((rect.w / cw).floor().max(1.0) as usize).min(p.grid.cols);
+        let rows = ((rect.h / ch).floor().max(1.0) as usize).min(p.grid.rows);
+        let x = (((px - rect.x) / cw).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+        let y = (((py - rect.y) / ch).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        Some((id, x, y))
+    }
+
+    fn mouse_mods(&self) -> MouseMods {
+        MouseMods {
+            shift: self.mods.shift_key(),
+            alt: self.mods.alt_key(),
+            ctrl: self.mods.control_key(),
+        }
+    }
+
+    /// Hands a mouse event to the program if it asked for one.
+    ///
+    /// Shift always keeps the event local. That is the convention every
+    /// terminal follows, and it is the only way to select text or reach our own
+    /// scrollback once a program has taken the mouse.
+    fn report_mouse(&mut self, px: f32, py: f32, event: MouseEv) -> bool {
+        if self.mods.shift_key() {
+            return false;
+        }
+        let Some((id, col, row)) = self.report_cell(px, py) else { return false };
+        let mods = self.mouse_mods();
+        let Some(p) = self.panes.get_mut(&id) else { return false };
+        let Some(bytes) =
+            mouse::encode(p.grid.mouse_tracking, p.grid.mouse_encoding, event, col, row, mods)
+        else {
+            return false;
+        };
+        p.pty.write(&bytes);
+        true
     }
 
     fn begin_selection(&mut self, px: f32, py: f32) {
@@ -1084,6 +1135,19 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed { format!("{START}{clean}{END}").into_bytes() } else { clean.into_bytes() }
 }
 
+/// The buttons a program can be told about. Anything else stays local.
+fn mouse_button(b: MouseButton) -> Option<MouseBtn> {
+    match b {
+        MouseButton::Left => Some(MouseBtn::Left),
+        MouseButton::Middle => Some(MouseBtn::Middle),
+        MouseButton::Right => Some(MouseBtn::Right),
+        _ => None,
+    }
+}
+
+/// One gesture must not be able to inject an unbounded burst of wheel reports.
+const WHEEL_REPORT_CAP: usize = 32;
+
 /// Vertical lines to scroll, from a wheel event's two axes.
 ///
 /// macOS swaps the scroll axes while Shift is held, and winit passes NSEvent's
@@ -1422,28 +1486,53 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
+                let (px, py) = self.cursor_pos;
                 if self.dragging {
-                    self.extend_selection(self.cursor_pos.0, self.cursor_pos.1);
+                    self.extend_selection(px, py);
                     self.request_redraw();
+                    return;
                 }
+                let held = self.reporting_drag.then_some(MouseBtn::Left);
+                self.report_mouse(px, py, MouseEv::Motion(held));
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                let (px, py) = self.cursor_pos;
+                // Middle and right only mean anything to a program that asked
+                // for the mouse; locally they have no binding yet.
                 if button != MouseButton::Left {
+                    let Some(b) = mouse_button(button) else { return };
+                    let ev = match state {
+                        ElementState::Pressed => MouseEv::Press(b),
+                        ElementState::Released => MouseEv::Release(b),
+                    };
+                    self.report_mouse(px, py, ev);
                     return;
                 }
                 match state {
                     ElementState::Pressed => {
-                        if let Some(id) = self.pane_at(self.cursor_pos.0, self.cursor_pos.1) {
+                        // Focus follows the click either way — the program owns
+                        // the pointer, not which pane we type into.
+                        if let Some(id) = self.pane_at(px, py) {
                             if id != self.focus {
                                 self.set_focus(id);
                                 self.update_title();
                             }
                         }
-                        self.begin_selection(self.cursor_pos.0, self.cursor_pos.1);
+                        if self.report_mouse(px, py, MouseEv::Press(MouseBtn::Left)) {
+                            self.reporting_drag = true;
+                            self.request_redraw();
+                            return;
+                        }
+                        self.begin_selection(px, py);
                         self.request_redraw();
                     }
                     ElementState::Released => {
+                        if self.reporting_drag {
+                            self.reporting_drag = false;
+                            self.report_mouse(px, py, MouseEv::Release(MouseBtn::Left));
+                            return;
+                        }
                         self.dragging = false;
                         // A click that never moved leaves nothing highlighted.
                         if self.selection.is_some_and(|(_, s)| s.is_empty()) {
@@ -1490,7 +1579,25 @@ impl ApplicationHandler<UserEvent> for App {
                      -> {lines:.2} lines, whole={whole}, scrollback={back}"
                 );
                 if whole != 0 {
-                    self.wheel_scroll(target, whole, shift);
+                    // A program that took the mouse gets the wheel too — that
+                    // is how `set -g mouse on` reaches tmux's copy mode, which
+                    // is the only way to scroll history we never see.
+                    let up = whole > 0;
+                    let mut sent = 0;
+                    for _ in 0..whole.unsigned_abs().min(WHEEL_REPORT_CAP) {
+                        if self.report_mouse(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            MouseEv::Wheel { up },
+                        ) {
+                            sent += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if sent == 0 {
+                        self.wheel_scroll(target, whole, shift);
+                    }
                     self.request_redraw();
                 }
             }
