@@ -50,6 +50,48 @@ pub enum CursorShape {
     Underline,
 }
 
+/// A character set that can be mapped into the printable range.
+///
+/// Only two of the VT100's sets matter in practice. `DecGraphics` is the one
+/// tmux and ncurses reach for whenever the terminal isn't in a UTF-8 locale —
+/// which is the normal case over ssh, where the remote often falls back to
+/// `C`/`POSIX` — and without it every box-drawing character arrives as the
+/// ASCII letter it shares a slot with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Charset {
+    Ascii,
+    DecGraphics,
+}
+
+impl Charset {
+    /// DEC Special Graphics occupies `_` through `~`; everything else is ASCII.
+    fn map(self, c: char) -> char {
+        if self == Charset::Ascii || !('_'..='~').contains(&c) {
+            return c;
+        }
+        const GRAPHICS: [char; 32] = [
+            ' ', '◆', '▒', '␉', '␌', '␍', '␊', '°', '±', '␤', '␋', '┘', '┐', '┌', '└', '┼', '⎺',
+            '⎻', '─', '⎼', '⎽', '├', '┤', '┴', '┬', '│', '≤', '≥', 'π', '≠', '£', '·',
+        ];
+        GRAPHICS[c as usize - '_' as usize]
+    }
+}
+
+/// Cursor state saved by DECSC (`ESC 7`) and CSI s, restored by DECRC / CSI u.
+/// The charset belongs here as much as the position does: a program that
+/// switches to line drawing, saves, and restores must come back to the set it
+/// saved, not to whatever is current.
+#[derive(Clone, Copy)]
+struct SavedCursor {
+    cx: usize,
+    cy: usize,
+    fg: Color,
+    bg: Color,
+    flags: u8,
+    charsets: [Charset; 2],
+    gl: usize,
+}
+
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
@@ -73,7 +115,12 @@ pub struct Grid {
     fg: Color,
     bg: Color,
     flags: u8,
-    saved: Option<(usize, usize, Color, Color, u8)>,
+    saved: Option<SavedCursor>,
+
+    /// The G0 and G1 character sets, and which of them SO/SI has mapped into
+    /// the printable range.
+    charsets: [Charset; 2],
+    gl: usize,
 
     /// Scroll region, inclusive rows.
     top: usize,
@@ -123,6 +170,8 @@ impl Grid {
             bg: Color::Default,
             flags: 0,
             saved: None,
+            charsets: [Charset::Ascii; 2],
+            gl: 0,
             top: 0,
             bot: rows - 1,
             wrap_pending: false,
@@ -335,7 +384,35 @@ impl Grid {
         }
     }
 
+    fn save_cursor(&mut self) {
+        self.saved = Some(SavedCursor {
+            cx: self.cx,
+            cy: self.cy,
+            fg: self.fg,
+            bg: self.bg,
+            flags: self.flags,
+            charsets: self.charsets,
+            gl: self.gl,
+        });
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some(s) = self.saved {
+            self.cx = s.cx.min(self.cols - 1);
+            self.cy = s.cy.min(self.rows - 1);
+            self.fg = s.fg;
+            self.bg = s.bg;
+            self.flags = s.flags;
+            self.charsets = s.charsets;
+            self.gl = s.gl;
+        }
+    }
+
     fn put(&mut self, c: char) {
+        // The active character set is applied before anything else: the width
+        // of a box-drawing glyph is the width that matters, not the width of
+        // the ASCII letter that stood in for it on the wire.
+        let c = self.charsets[self.gl].map(c);
         let w = c.width().unwrap_or(1).max(1);
 
         if self.wrap_pending {
@@ -544,6 +621,9 @@ impl vte::Perform for Performer<'_> {
                 g.cx = next.min(g.cols - 1);
             }
             0x07 => g.bell = true,
+            // Shift Out / Shift In: swap which designated set is printable.
+            0x0e => g.gl = 1,
+            0x0f => g.gl = 0,
             _ => {}
         }
     }
@@ -645,16 +725,8 @@ impl vte::Perform for Performer<'_> {
                     g.cy = top;
                 }
             }
-            's' => g.saved = Some((g.cx, g.cy, g.fg, g.bg, g.flags)),
-            'u' => {
-                if let Some((cx, cy, fg, bg, fl)) = g.saved {
-                    g.cx = cx.min(g.cols - 1);
-                    g.cy = cy.min(g.rows - 1);
-                    g.fg = fg;
-                    g.bg = bg;
-                    g.flags = fl;
-                }
-            }
+            's' => g.save_cursor(),
+            'u' => g.restore_cursor(),
             'q' if intermediates.first() == Some(&b' ') => {
                 g.cursor_shape = match flat.first().copied().unwrap_or(0) {
                     3 | 4 => CursorShape::Underline,
@@ -672,10 +744,21 @@ impl vte::Perform for Performer<'_> {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        let g = &mut self.grid;
+        // `ESC ( x` designates a set as G0, `ESC ) x` as G1. `0` is DEC Special
+        // Graphics — tmux's pane dividers and every ncurses box outside a UTF-8
+        // locale — and anything else is close enough to ASCII to treat as such.
+        if let Some(slot) = match intermediates.first() {
+            Some(b'(') => Some(0),
+            Some(b')') => Some(1),
+            _ => None,
+        } {
+            g.charsets[slot] = if byte == b'0' { Charset::DecGraphics } else { Charset::Ascii };
+            return;
+        }
         if !intermediates.is_empty() {
             return;
         }
-        let g = &mut self.grid;
         match byte {
             b'D' => g.newline(),
             b'E' => {
@@ -689,16 +772,8 @@ impl vte::Perform for Performer<'_> {
                     g.cy = g.cy.saturating_sub(1);
                 }
             }
-            b'7' => g.saved = Some((g.cx, g.cy, g.fg, g.bg, g.flags)),
-            b'8' => {
-                if let Some((cx, cy, fg, bg, fl)) = g.saved {
-                    g.cx = cx.min(g.cols - 1);
-                    g.cy = cy.min(g.rows - 1);
-                    g.fg = fg;
-                    g.bg = bg;
-                    g.flags = fl;
-                }
-            }
+            b'7' => g.save_cursor(),
+            b'8' => g.restore_cursor(),
             b'c' => {
                 let (cols, rows) = (g.cols, g.rows);
                 **g = Grid::new(cols, rows);
@@ -1257,6 +1332,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dec_line_drawing_turns_letters_into_box_characters() {
+        // Without a UTF-8 locale — the usual state of a machine reached over
+        // ssh — tmux draws its pane dividers this way, and they arrived as
+        // literal rows of `q`.
+        let g = feed(10, 2, &["\x1b(0qqqxlk\x1b(Bqx"]);
+        assert_eq!(row_text(&g, 0), "───│┌┐qx");
+    }
+
+    #[test]
+    fn shift_out_selects_the_other_charset() {
+        // G1 holds the graphics set; SO maps it in, SI takes it back out.
+        let g = feed(10, 2, &["\x1b)0a\x0eq\x0fq"]);
+        assert_eq!(row_text(&g, 0), "a─q");
+    }
+
+    #[test]
+    fn the_saved_cursor_carries_its_charset() {
+        // Save while drawing boxes, print ASCII, restore: `q` must be a line
+        // again, not the letter.
+        let g = feed(10, 2, &["\x1b(0\x1b7\x1b(Bx\x1b8q"]);
+        assert_eq!(row_text(&g, 0), "─", "the restore did not bring the charset back");
+    }
+
+    #[test]
+    fn a_charset_switch_does_not_cancel_a_pending_wrap() {
+        let g = feed(4, 3, &["abcd", "\x1b(0", "q"]);
+        assert_eq!(row_text(&g, 0), "abcd");
+        assert_eq!(row_text(&g, 1), "─");
     }
 }
 
