@@ -486,18 +486,13 @@ impl App {
     /// here too would make `Shift+PageUp` move an application's *cursor*
     /// instead of its view, and a page's worth of arrows is not a page anyway.
     ///
-    /// Unconditional only because no mouse reporting exists yet (no DECSET
-    /// 1000/1002/1003/1006 in grid.rs). When that lands, an application with
-    /// tracking enabled must receive mouse sequences instead, and xterm
-    /// additionally gates the arrow-key fallback on DECSET 1007.
+    /// Reached only when no mouse report went out: a program with tracking on
+    /// gets the wheel itself, and the caller has already tried that.
     fn wheel_scroll(&mut self, id: PaneId, lines: isize, shift: bool) {
         if lines == 0 {
             return;
         }
-        // 1007 off means the program has said not to synthesise arrows, which
-        // is what tmux does once it handles the mouse itself.
-        let arrows_allowed =
-            self.panes.get(&id).is_some_and(|p| p.grid.alt_active && p.grid.alternate_scroll);
+        let arrows_allowed = self.panes.get(&id).is_some_and(|p| arrows_allowed(&p.grid));
         if wheel_action(shift, arrows_allowed) == WheelAction::Viewport {
             self.scroll_pane(id, lines);
             return;
@@ -1190,6 +1185,23 @@ const WHEEL_REPORT_CAP: usize = 32;
 /// nothing at all.
 fn wheel_lines(across: f32, down: f32, shift: bool) -> f32 {
     if shift && across.abs() > down.abs() { across } else { down }
+}
+
+/// Whether this pane's program may have the wheel as arrow keys.
+///
+/// Three conditions, and the third is the one experience forced. Alternate
+/// scroll is for a program that never heard of the mouse: less, man, vim and
+/// top all enter the alternate screen and none of them mentions mouse tracking,
+/// so arrows are the only thing the wheel can mean to them.
+///
+/// tmux is not that program. It disables 1000/1002/1003 as it starts, whether
+/// or not `mouse` is on, because it means to own the pointer either way — and
+/// it never sends 1007, so that mode alone cannot tell the two apart. Sending
+/// arrows anyway put them through tmux into the shell's line editor, where they
+/// read as command history: the wheel scrolled nothing and rewrote the command
+/// line instead.
+fn arrows_allowed(g: &grid::Grid) -> bool {
+    g.alt_active && g.alternate_scroll && !g.mouse_declined
 }
 
 /// Where a wheel event should go.
@@ -2172,5 +2184,42 @@ mod tests {
         // A trackpad rarely reports a clean zero on the other axis.
         assert_eq!(wheel_lines(6.0, 0.4, true), 6.0);
         assert_eq!(wheel_lines(0.4, 6.0, true), 6.0);
+    }
+
+    /// A pane's grid after `input`, for the wheel-routing questions below.
+    fn grid_after(input: &[u8]) -> grid::Grid {
+        let mut g = grid::Grid::new(20, 5);
+        let mut parser = vte::Parser::new();
+        let mut perf = grid::Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, input);
+        g
+    }
+
+    #[test]
+    fn a_pager_on_the_alternate_screen_gets_its_arrow_keys() {
+        // What less, man, top and vim all send: the alternate screen and not a
+        // word about the mouse.
+        assert!(arrows_allowed(&grid_after(b"\x1b[?1049h")));
+        // ...and never on the main screen, where our own scrollback is the view.
+        assert!(!arrows_allowed(&grid_after(b"")));
+    }
+
+    #[test]
+    fn tmux_does_not_get_arrow_keys_it_never_asked_for() {
+        // The regression, in the bytes tmux sends as it starts with `mouse`
+        // off. The arrows used to go through tmux into the shell's line editor,
+        // where they read as command history: the wheel scrolled nothing and
+        // rewrote the command line instead.
+        let g = grid_after(b"\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+        assert!(!arrows_allowed(&g));
+        // Which leaves the wheel driving our own viewport.
+        assert_eq!(wheel_action(false, arrows_allowed(&g)), WheelAction::Viewport);
+    }
+
+    #[test]
+    fn declining_1007_still_declines() {
+        // The mode that was always meant to answer this. Programs that send it
+        // are rarer than the ones that don't, but it must keep working.
+        assert!(!arrows_allowed(&grid_after(b"\x1b[?1049h\x1b[?1007l")));
     }
 }

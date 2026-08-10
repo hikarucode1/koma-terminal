@@ -98,6 +98,16 @@ pub struct Grid {
     /// on the alternate screen? On by default, which is what less and man
     /// expect; tmux turns it off once it handles the mouse itself.
     pub alternate_scroll: bool,
+    /// Whether the program has turned mouse tracking off in so many words.
+    ///
+    /// 1007 is the mode that ought to answer "may the wheel become arrow keys",
+    /// and tmux never sends it either way — so on its own it cannot tell a
+    /// pager from a multiplexer. This can: less, man, vim and top never mention
+    /// mouse tracking at all, while tmux disables 1000/1002/1003 the moment it
+    /// starts, because it means to own the pointer whether or not `mouse` is on.
+    /// Having said that much, it is not a program that wants keystrokes
+    /// synthesised for it.
+    pub mouse_declined: bool,
     /// Alternate screen buffer, saved main screen while active.
     alt: Option<(Vec<Cell>, usize, usize)>,
     pub alt_active: bool,
@@ -133,6 +143,7 @@ impl Grid {
             mouse_tracking: MouseTracking::Off,
             mouse_encoding: MouseEncoding::Legacy,
             alternate_scroll: true,
+            mouse_declined: false,
             alt: None,
             alt_active: false,
         }
@@ -404,15 +415,18 @@ impl Grid {
                 // notion of falling back to a lesser mode.
                 (true, 1000) => {
                     self.mouse_tracking =
-                        if enable { MouseTracking::Normal } else { MouseTracking::Off }
+                        if enable { MouseTracking::Normal } else { MouseTracking::Off };
+                    self.mouse_declined = !enable;
                 }
                 (true, 1002) => {
                     self.mouse_tracking =
-                        if enable { MouseTracking::ButtonEvent } else { MouseTracking::Off }
+                        if enable { MouseTracking::ButtonEvent } else { MouseTracking::Off };
+                    self.mouse_declined = !enable;
                 }
                 (true, 1003) => {
                     self.mouse_tracking =
-                        if enable { MouseTracking::AnyEvent } else { MouseTracking::Off }
+                        if enable { MouseTracking::AnyEvent } else { MouseTracking::Off };
+                    self.mouse_declined = !enable;
                 }
                 (true, 1006) => {
                     self.mouse_encoding =
@@ -430,6 +444,10 @@ impl Grid {
             return;
         }
         if on {
+            // A new program gets the benefit of the doubt. tmux states its case
+            // just after this — it sends `1049h` first and disables the mouse
+            // modes second — so clearing here does not throw that away.
+            self.mouse_declined = false;
             self.alt = Some((self.cells.clone(), self.cx, self.cy));
             self.cells.fill(Cell::default());
             self.cx = 0;
@@ -1257,6 +1275,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_program_that_turns_the_mouse_off_is_saying_so_on_purpose() {
+        // The sequences tmux actually sends as it starts, in the order it sends
+        // them: the alternate screen first, the mouse modes after.
+        let g = feed(20, 3, &["\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"]);
+        assert!(g.alt_active);
+        assert!(g.mouse_declined, "tmux said it does not want the mouse");
+        // A pager says nothing about the mouse, and must keep its arrow keys.
+        let g = feed(20, 3, &["\x1b[?1049h"]);
+        assert!(!g.mouse_declined);
+    }
+
+    #[test]
+    fn turning_the_mouse_back_on_takes_the_refusal_back() {
+        // `set -g mouse on`: tmux resets the modes, then enables them.
+        let g =
+            feed(20, 3, &["\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1006h\x1b[?1000h\x1b[?1002h"]);
+        assert!(!g.mouse_declined);
+        assert_eq!(g.mouse_tracking, MouseTracking::ButtonEvent);
+    }
+
+    #[test]
+    fn each_program_gets_the_benefit_of_the_doubt() {
+        // Leaving tmux and opening a pager must not carry tmux's refusal over.
+        let g = feed(20, 3, &["\x1b[?1049h\x1b[?1000l\x1b[?1002l", "\x1b[?1049l", "\x1b[?1049h"]);
+        assert!(!g.mouse_declined, "the pager never declined anything");
     }
 }
 
