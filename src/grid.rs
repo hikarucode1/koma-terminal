@@ -85,6 +85,11 @@ pub struct Grid {
 
     pub title: String,
     pub bell: bool,
+    /// Text a program asked us to put on the system clipboard (OSC 52), waiting
+    /// for the app to pick it up. Over ssh this is the only route a copy has:
+    /// the program — tmux, say — is on the far end, and its own paste buffer
+    /// lives there with it.
+    pub pending_clipboard: Option<String>,
     /// Application cursor keys (DECCKM) — changes what arrow keys send.
     pub app_cursor_keys: bool,
     /// Bracketed paste (DECSET 2004). When the program asks for it, pasted
@@ -128,6 +133,7 @@ impl Grid {
             wrap_pending: false,
             title: String::new(),
             bell: false,
+            pending_clipboard: None,
             app_cursor_keys: false,
             bracketed_paste: false,
             mouse_tracking: MouseTracking::Off,
@@ -518,6 +524,82 @@ pub struct Performer<'a> {
     pub reply: Vec<u8>,
 }
 
+/// The largest OSC 52 payload we will decode. Three bytes of clipboard per four
+/// of base64, so this is a 6 MiB copy — far past any real one, and short of
+/// letting a runaway program have the heap.
+const MAX_CLIPBOARD_BASE64: usize = 8 << 20;
+
+impl Performer<'_> {
+    /// The payload of an OSC 52.
+    ///
+    /// `?` asks us to send the clipboard *back*, and we never answer it: that
+    /// would hand whatever the user last copied — a password, most likely — to
+    /// whatever is running on the far end of an ssh session, for the asking.
+    /// Writes are honoured, reads are not.
+    fn set_clipboard(&mut self, payload: &[u8]) {
+        // An empty payload is xterm's "clear the selection". Wiping the local
+        // clipboard on a remote program's say-so is the sort of thing you only
+        // notice by pasting the wrong thing, so it is a no-op here.
+        if payload == b"?" || payload.is_empty() {
+            return;
+        }
+        if payload.len() > MAX_CLIPBOARD_BASE64 {
+            log::warn!("ignoring an OSC 52 payload of {} bytes", payload.len());
+            return;
+        }
+        match decode_base64(payload) {
+            Some(bytes) => {
+                self.grid.pending_clipboard = Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            None => log::warn!("OSC 52 payload was not base64"),
+        }
+    }
+}
+
+/// Base64 as OSC 52 spells it, tolerating missing padding and any line breaks a
+/// sender wrapped the payload with. Anything else is rejected rather than
+/// decoded past: a clipboard full of garbage is worse than a copy that failed.
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    fn sextet(b: u8) -> Option<u32> {
+        Some(match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a') as u32 + 26,
+            b'0'..=b'9' => (b - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut acc = 0u32;
+    // How many bits of `acc` are still waiting to make up a byte. Never 8 or
+    // more on the way round the loop, so the low bits are all that matter and
+    // whatever has been shifted up past them can be ignored.
+    let mut bits = 0u32;
+    for &b in input {
+        match b {
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            // Padding, and nothing that follows it carries data.
+            b'=' => break,
+            _ => {}
+        }
+        acc = (acc << 6) | sextet(b)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    // Four sextets are three bytes, so a group can legitimately end with 2 or 4
+    // bits over. Six left means a lone trailing character that spells no byte at
+    // all: the payload was cut short, not merely unpadded.
+    if bits >= 6 {
+        return None;
+    }
+    Some(out)
+}
+
 impl vte::Perform for Performer<'_> {
     fn print(&mut self, c: char) {
         self.grid.put(c);
@@ -708,13 +790,17 @@ impl vte::Perform for Performer<'_> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // OSC 0/1/2 all set (some flavour of) the window title.
         match params.first() {
+            // OSC 0/1/2 all set (some flavour of) the window title.
             Some(&b"0") | Some(&b"1") | Some(&b"2") => {
                 if let Some(t) = params.get(1) {
                     self.grid.title = String::from_utf8_lossy(t).into_owned();
                 }
             }
+            // OSC 52: put this on the clipboard. The selection it names — `c`,
+            // `p`, a cut buffer, or nothing at all, which is what tmux sends —
+            // is ignored, because there is only one clipboard here to write to.
+            Some(&b"52") => self.set_clipboard(params.get(2).copied().unwrap_or(b"")),
             _ => {}
         }
     }
@@ -1257,6 +1343,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The one route a copy has out of tmux on the far end of an ssh session.
+    #[test]
+    fn osc_52_puts_text_on_the_clipboard() {
+        // BEL-terminated, and ST-terminated, which is what tmux sends.
+        let g = feed(20, 3, &["\x1b]52;c;aGVsbG8=\x07"]);
+        assert_eq!(g.pending_clipboard.as_deref(), Some("hello"));
+        let g = feed(20, 3, &["\x1b]52;c;aGVsbG8=\x1b\\"]);
+        assert_eq!(g.pending_clipboard.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn osc_52_takes_any_selection_name() {
+        // tmux names no selection at all; xterm's own clients say c, p, or a cut
+        // buffer. There is one clipboard here, so all of them write to it.
+        for target in ["", "c", "p", "s0", "pc"] {
+            let g = feed(20, 3, &[&format!("\x1b]52;{target};aGk=\x07")]);
+            assert_eq!(g.pending_clipboard.as_deref(), Some("hi"), "target {target:?}");
+        }
+    }
+
+    #[test]
+    fn osc_52_carries_multibyte_text() {
+        // 日本語 as base64. Nothing about the payload is per-character, so this
+        // is really a check that we decode bytes and only then read them as text.
+        let g = feed(20, 3, &["\x1b]52;c;5pel5pys6Kqe\x07"]);
+        assert_eq!(g.pending_clipboard.as_deref(), Some("日本語"));
+    }
+
+    /// Answering would hand the local clipboard to whatever is on the far end.
+    #[test]
+    fn osc_52_queries_are_never_answered() {
+        let mut g = Grid::new(20, 3);
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\x1b]52;c;?\x07");
+        assert!(perf.reply.is_empty(), "the clipboard leaked back to the program");
+        assert!(g.pending_clipboard.is_none());
+    }
+
+    #[test]
+    fn osc_52_leaves_the_clipboard_alone_when_it_says_nothing() {
+        // xterm reads an empty payload as "clear the selection". Wiping what the
+        // user copied on a remote program's say-so is worse than ignoring it.
+        let g = feed(20, 3, &["\x1b]52;c;\x07"]);
+        assert!(g.pending_clipboard.is_none());
+        let g = feed(20, 3, &["\x1b]52;c\x07"]);
+        assert!(g.pending_clipboard.is_none());
+    }
+
+    #[test]
+    fn a_bad_osc_52_payload_is_dropped_rather_than_pasted_as_garbage() {
+        let g = feed(20, 3, &["\x1b]52;c;not base64!!\x07"]);
+        assert!(g.pending_clipboard.is_none());
+    }
+
+    #[test]
+    fn base64_decodes_every_padding_case() {
+        // The three group lengths: no padding, one =, two =.
+        assert_eq!(decode_base64(b"YWJj").unwrap(), b"abc");
+        assert_eq!(decode_base64(b"YWJjZA==").unwrap(), b"abcd");
+        assert_eq!(decode_base64(b"YWJjZGU=").unwrap(), b"abcde");
+        // Unpadded is accepted too: senders vary, and the length is unambiguous.
+        assert_eq!(decode_base64(b"YWJjZA").unwrap(), b"abcd");
+        assert_eq!(decode_base64(b"YWJjZGU").unwrap(), b"abcde");
+        assert_eq!(decode_base64(b"").unwrap(), b"");
+        // Both non-alphanumeric characters of the standard alphabet.
+        assert_eq!(decode_base64(b"++//").unwrap(), &[0xfb, 0xef, 0xff]);
+    }
+
+    #[test]
+    fn base64_tolerates_wrapped_lines_but_not_junk() {
+        assert_eq!(decode_base64(b"YWJj\r\nZGVm").unwrap(), b"abcdef");
+        assert_eq!(decode_base64(b" YWJj ").unwrap(), b"abc");
+        // A lone trailing character spells no whole byte: cut short, not merely
+        // unpadded, and decoding it would hand back a truncated copy.
+        assert!(decode_base64(b"YWJjZ").is_none());
+        assert!(decode_base64(b"Y").is_none());
+        assert!(decode_base64(b"YWJj$").is_none());
+        // URL-safe base64 is a different alphabet; rejecting beats mangling.
+        assert!(decode_base64(b"a-b_").is_none());
     }
 }
 
