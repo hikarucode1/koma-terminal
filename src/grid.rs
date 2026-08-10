@@ -662,11 +662,37 @@ impl vte::Perform for Performer<'_> {
                     _ => CursorShape::Block,
                 };
             }
-            'n' if flat.first() == Some(&6) => {
-                // Device Status Report: report cursor position.
+            // XTVERSION: name ourselves. tmux asks alongside the two device
+            // attributes queries, and takes silence for an answer, but naming
+            // ourselves is both cheap and what it is actually asking for.
+            'q' if intermediates.first() == Some(&b'>') => {
+                self.reply.extend_from_slice(
+                    format!("\x1bP>|koma({})\x1b\\", env!("CARGO_PKG_VERSION")).as_bytes(),
+                );
+            }
+            'n' if !private && flat.first() == Some(&6) => {
+                // Device Status Report: report cursor position. Gated on the
+                // plain form: `CSI ? 6 n` is DECXCPR and wants its own reply, so
+                // answering it with a CPR would be a reply the asker cannot
+                // parse — see the device-attributes note below for where that
+                // ends up.
                 self.reply.extend_from_slice(format!("\x1b[{};{}R", g.cy + 1, g.cx + 1).as_bytes());
             }
-            'c' => self.reply.extend_from_slice(b"\x1b[?6c"), // identify as a VT102
+            'c' => match intermediates.first() {
+                // Primary DA: identify as a VT102.
+                None => self.reply.extend_from_slice(b"\x1b[?6c"),
+                // Secondary DA (`CSI > c`) asks what model and version we are,
+                // and the answer has to be in its own `CSI > ... c` form.
+                //
+                // We used to send the primary reply to both. tmux asks both
+                // questions the moment it starts, could not parse `\x1b[?6c` as
+                // an answer to the second, and did what it does with input it
+                // doesn't recognise: passed it to the pane as keystrokes. So
+                // every tmux session opened with `^[[?6c` echoed at the prompt
+                // and `6c` left on the command line.
+                Some(b'>') => self.reply.extend_from_slice(b"\x1b[>0;0;0c"),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1257,6 +1283,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Runs `input` and returns whatever the terminal wants to send back.
+    fn reply_to(input: &[u8]) -> Vec<u8> {
+        let mut g = Grid::new(20, 5);
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, input);
+        perf.reply
+    }
+
+    #[test]
+    fn the_two_device_attributes_queries_get_their_own_answers() {
+        // The regression. tmux asks both the moment it starts. Answering the
+        // secondary query with the primary reply gave tmux something it could
+        // not parse, and tmux hands unparsed input to the pane — so every
+        // session began with `^[[?6c` echoed and `6c` typed at the prompt.
+        assert_eq!(reply_to(b"\x1b[c"), b"\x1b[?6c");
+        assert_eq!(reply_to(b"\x1b[0c"), b"\x1b[?6c");
+        assert_eq!(reply_to(b"\x1b[>c"), b"\x1b[>0;0;0c");
+        assert_eq!(reply_to(b"\x1b[>0c"), b"\x1b[>0;0;0c");
+    }
+
+    #[test]
+    fn a_secondary_attributes_reply_is_never_a_primary_one() {
+        // Stated as the property rather than the byte string: whatever we grow
+        // into, the two replies must stay tellable apart by their asker.
+        let secondary = reply_to(b"\x1b[>c");
+        assert!(secondary.starts_with(b"\x1b[>"), "tmux looks for CSI > here");
+        assert_ne!(secondary, reply_to(b"\x1b[c"));
+    }
+
+    #[test]
+    fn a_cursor_report_answers_only_the_query_that_asked_for_it() {
+        assert_eq!(reply_to(b"\x1b[3;7H\x1b[6n"), b"\x1b[3;7R");
+        // DECXCPR wants a `CSI ? ... R`. Saying nothing is better than saying
+        // something the asker will feed to the shell as keystrokes.
+        assert!(reply_to(b"\x1b[3;7H\x1b[?6n").is_empty());
+        // The mode query tmux sends looking for a light/dark answer.
+        assert!(reply_to(b"\x1b[?996n").is_empty());
+    }
+
+    #[test]
+    fn xtversion_names_the_terminal() {
+        let r = reply_to(b"\x1b[>0q");
+        let s = String::from_utf8_lossy(&r);
+        assert!(s.starts_with("\x1bP>|koma("), "unexpected XTVERSION reply: {s:?}");
+        assert!(s.ends_with("\x1b\\"), "XTVERSION must be ST-terminated: {s:?}");
+    }
+
+    #[test]
+    fn setting_the_cursor_style_still_works() {
+        // `CSI Ps SP q` shares its final byte with XTVERSION, so the two must
+        // not be confused for each other.
+        let g = feed(10, 3, &["\x1b[5 q"]);
+        assert!(matches!(g.cursor_shape, CursorShape::Bar));
+        assert!(reply_to(b"\x1b[5 q").is_empty());
     }
 }
 
