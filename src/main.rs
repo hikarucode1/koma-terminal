@@ -486,19 +486,14 @@ impl App {
     /// here too would make `Shift+PageUp` move an application's *cursor*
     /// instead of its view, and a page's worth of arrows is not a page anyway.
     ///
-    /// Unconditional only because no mouse reporting exists yet (no DECSET
-    /// 1000/1002/1003/1006 in grid.rs). When that lands, an application with
-    /// tracking enabled must receive mouse sequences instead, and xterm
-    /// additionally gates the arrow-key fallback on DECSET 1007.
+    /// Reached when no mouse report went out. That is not the same as the
+    /// program not wanting one — see `arrows_allowed`.
     fn wheel_scroll(&mut self, id: PaneId, lines: isize, shift: bool) {
         if lines == 0 {
             return;
         }
-        // 1007 off means the program has said not to synthesise arrows, which
-        // is what tmux does once it handles the mouse itself.
-        let arrows_allowed =
-            self.panes.get(&id).is_some_and(|p| p.grid.alt_active && p.grid.alternate_scroll);
-        if wheel_action(shift, arrows_allowed) == WheelAction::Viewport {
+        let allowed = self.panes.get(&id).is_some_and(|p| arrows_allowed(&p.grid));
+        if wheel_action(shift, allowed) == WheelAction::Viewport {
             self.scroll_pane(id, lines);
             return;
         }
@@ -1192,6 +1187,23 @@ fn wheel_lines(across: f32, down: f32, shift: bool) -> f32 {
     if shift && across.abs() > down.abs() { across } else { down }
 }
 
+/// Whether this pane's program may have the wheel as arrow keys.
+///
+/// Alternate scroll is for a program that never heard of the mouse — less,
+/// man, vim — where arrows are the only thing the wheel can mean. A program
+/// with tracking enabled is not that program, and the check matters because
+/// reaching here does not mean no report was wanted: `report_mouse` also
+/// declines when the pointer resolves to no cell at all.
+///
+/// The window's padding and the gap between panes are both such places, and so
+/// is any column past 222 under the legacy encoding, which cannot spell it. A
+/// wheel tick there used to be answered with arrow keys — sent to a program
+/// that had asked for mouse reports and would read them as cursor movement, or
+/// pass them through to a shell's line editor as command history.
+fn arrows_allowed(g: &grid::Grid) -> bool {
+    g.alt_active && g.alternate_scroll && g.mouse_tracking == mouse::Tracking::Off
+}
+
 /// Where a wheel event should go.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WheelAction {
@@ -1206,8 +1218,8 @@ enum WheelAction {
 /// the alternate screen — replays arrow keys into the command line instead of
 /// scrolling, which is what the arrows mean to a line editor.
 ///
-/// `arrows_allowed` is the alternate screen *and* DECSET 1007 still set: a
-/// program that handles the mouse itself turns 1007 off to decline them.
+/// `arrows_allowed` is the caller's answer to whether this program should be
+/// getting arrows at all — see the function of that name for what goes into it.
 fn wheel_action(shift: bool, arrows_allowed: bool) -> WheelAction {
     if shift || !arrows_allowed { WheelAction::Viewport } else { WheelAction::Application }
 }
@@ -2172,5 +2184,56 @@ mod tests {
         // A trackpad rarely reports a clean zero on the other axis.
         assert_eq!(wheel_lines(6.0, 0.4, true), 6.0);
         assert_eq!(wheel_lines(0.4, 6.0, true), 6.0);
+    }
+
+    /// A pane's grid after `input`, for the wheel-routing questions below.
+    fn grid_after(input: &[u8]) -> grid::Grid {
+        let mut g = grid::Grid::new(20, 5);
+        let mut parser = vte::Parser::new();
+        let mut perf = grid::Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, input);
+        g
+    }
+
+    #[test]
+    fn a_pager_on_the_alternate_screen_gets_its_arrow_keys() {
+        // less, man, vim and top all enter the alternate screen and say nothing
+        // about the mouse. Arrows are the only thing the wheel can mean to them.
+        assert!(arrows_allowed(&grid_after(b"\x1b[?1049h")));
+        // Never on the main screen, where our own scrollback is the view.
+        assert!(!arrows_allowed(&grid_after(b"")));
+        // And 1007 still declines them, for the programs that bother to send it.
+        assert!(!arrows_allowed(&grid_after(b"\x1b[?1049h\x1b[?1007l")));
+    }
+
+    #[test]
+    fn a_program_holding_the_mouse_is_never_sent_arrows() {
+        // Reaching the arrow path does not mean no report was wanted: a wheel
+        // tick over the window's padding, over the gap between two panes, or
+        // past column 222 under the legacy encoding resolves to no cell, so no
+        // report goes out and the fallback runs anyway. Answering that with
+        // arrow keys sends a program that asked for mouse reports something it
+        // reads as cursor movement — or, in tmux's case, hands it to the shell
+        // underneath as command history.
+        for modes in [
+            &b"\x1b[?1049h\x1b[?1000h"[..],            // press/release
+            &b"\x1b[?1049h\x1b[?1002h"[..],            // and drags
+            &b"\x1b[?1049h\x1b[?1003h"[..],            // and all motion
+            &b"\x1b[?1049h\x1b[?1002h\x1b[?1006h"[..], // what tmux sends
+        ] {
+            let g = grid_after(modes);
+            assert_ne!(g.mouse_tracking, mouse::Tracking::Off);
+            assert!(!arrows_allowed(&g), "arrows went to a program holding the mouse");
+            assert_eq!(wheel_action(false, arrows_allowed(&g)), WheelAction::Viewport);
+        }
+    }
+
+    #[test]
+    fn giving_the_mouse_back_restores_the_arrow_keys() {
+        // A curses application calling mousemask(0) mid-run is still on the
+        // alternate screen and still wants arrows. Both orderings, because a
+        // program may enable tracking before it enters the alternate screen.
+        assert!(arrows_allowed(&grid_after(b"\x1b[?1049h\x1b[?1000h\x1b[?1000l")));
+        assert!(arrows_allowed(&grid_after(b"\x1b[?1000h\x1b[?1049h\x1b[?1000l")));
     }
 }
