@@ -251,6 +251,15 @@ impl Grid {
         }
     }
 
+    /// Moves the viewport `lines` back through history, clamped to what is
+    /// retained. See `view_row` for what this means while the alternate screen
+    /// is up: it covers the running program with what came before it.
+    pub fn scroll_view(&mut self, lines: isize) {
+        let max = self.scrollback.len() as isize;
+        let next = self.view_offset as isize + lines;
+        self.view_offset = next.clamp(0, max) as usize;
+    }
+
     /// Row id for viewport row `y`, stable as the line scrolls into history.
     ///
     /// Viewport rows above the fold come from scrollback and those below from

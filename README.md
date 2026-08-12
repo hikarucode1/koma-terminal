@@ -143,7 +143,7 @@ the box glyph's, not that of the letter standing in for it on the wire.
 cargo test
 ```
 
-206 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+211 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, resize moving rows to and from
 history and carrying the alternate screen's saved buffer with it, SGR including
 truecolor, alt screen, wide characters, DEC line drawing and the charset a saved
@@ -157,7 +157,8 @@ that a single removal pass would splice back together), the OSC 52 clipboard
 rejected rather than half-decoded, and a read request going unanswered), the
 split tree (even sizing across repeated splits and across a close-induced
 collapse, non-overlap, directional focus), leader/modifier resolution, sub-line
-scroll accumulation, wheel axis selection, alternate-scroll encoding, mouse
+scroll accumulation, wheel axis selection, alternate-scroll encoding and where
+a wheel tick goes when the program holding the mouse did not receive it, mouse
 reporting (SGR and legacy encodings, which events each tracking mode wants, the
 legacy column ceiling), IME composition layout (wrapping, kana taking two
 columns, active-segment byte ranges, caret tracking, and which pane a
