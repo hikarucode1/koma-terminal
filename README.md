@@ -51,24 +51,20 @@ In a full-screen app (vim, less, man) the application owns the whole viewport
 and we keep no scrollback for it. **Wheel** scrolling is translated into arrow
 keys so the application scrolls itself — xterm calls this alternate scroll.
 
-Not for tmux, though. tmux takes charge of the mouse as it starts, whether or
-not `mouse` is on, and a program that has said that much does not want
-keystrokes invented for it: the arrows would go straight through to the shell's
-line editor, which reads them as command history. So the wheel keeps driving
-koma's own viewport there.
+**Hold Shift to take the wheel back.** Shift+wheel always drives koma's own
+viewport and never the program, which is what you want inside tmux: there the
+arrow keys reach a shell's line editor and get read as history navigation
+rather than scrolling.
 
-**Hold Shift to take the wheel back** anywhere else. Shift+wheel always drives
-koma's viewport and never the program.
-
-What either one shows you inside a full-screen program is *our* scrollback:
+What Shift+wheel shows you inside a full-screen program is *our* scrollback:
 whatever was on screen before that program started. Over ssh into a tmux
 session that is almost nothing, since tmux keeps its own history and koma
 cannot see it.
 
-**To scroll tmux's history, give tmux the mouse**: `set -g mouse on` on the
-remote, and the wheel reaches tmux itself, which scrolls its history in copy
-mode. Shift still keeps any event local, which is how you select text or reach
-our scrollback while a program owns the pointer.
+For that, mouse reporting is the answer: with `set -g mouse on`, tmux
+receives the wheel itself and scrolls its own history in copy mode. Shift
+still keeps any event local, which is how you select text or reach our
+scrollback while a program owns the pointer.
 
 Everything else is encoded and forwarded to the shell.
 
@@ -119,7 +115,7 @@ coverage.
 cargo test
 ```
 
-194 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+184 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, resize moving rows to and from
 history, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
@@ -129,8 +125,7 @@ escape sequences, and an end marker that a single removal pass would splice
 back together), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
-accumulation, wheel axis selection, alternate-scroll encoding and who is
-allowed it, mouse
+accumulation, wheel axis selection, alternate-scroll encoding, mouse
 reporting (SGR and legacy encodings, which events each tracking mode wants,
 the legacy column ceiling), IME
 composition layout (wrapping, kana taking two columns, active-segment byte

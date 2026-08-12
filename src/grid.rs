@@ -96,28 +96,8 @@ pub struct Grid {
     pub mouse_encoding: MouseEncoding,
     /// Alternate scroll (DECSET 1007): may the wheel be turned into arrow keys
     /// on the alternate screen? On by default, which is what less and man
-    /// expect. Few programs send it in either direction — tmux never does —
-    /// so `mouse_declined` below is what usually settles the question.
+    /// expect; tmux turns it off once it handles the mouse itself.
     pub alternate_scroll: bool,
-    /// Whether the program turned mouse tracking off without ever having asked
-    /// for it — which is a program saying it means to own the pointer, not one
-    /// that has finished with it.
-    ///
-    /// 1007 is the mode that ought to answer "may the wheel become arrow keys",
-    /// and tmux never sends it either way, so on its own it cannot tell a pager
-    /// from a multiplexer. This can: less, man, vim, nano and top never mention
-    /// mouse tracking at all, while tmux disables 1000/1002/1003 the moment it
-    /// starts, whether or not `mouse` is on.
-    ///
-    /// The "without ever having asked" is what keeps an ordinary program's
-    /// wheel working. A curses application that takes the mouse and later gives
-    /// it back — `mousemask(0)` — is still on the alternate screen and still
-    /// wants arrows; reading that as a refusal left it with no wheel at all,
-    /// since tracking is off by then and no report goes out either.
-    pub mouse_declined: bool,
-    /// Whether tracking has been asked for since this program took the screen.
-    /// Only meaningful next to `mouse_declined`, which is why it is not public.
-    mouse_ever_enabled: bool,
     /// Alternate screen buffer, saved main screen while active.
     alt: Option<(Vec<Cell>, usize, usize)>,
     pub alt_active: bool,
@@ -153,8 +133,6 @@ impl Grid {
             mouse_tracking: MouseTracking::Off,
             mouse_encoding: MouseEncoding::Legacy,
             alternate_scroll: true,
-            mouse_declined: false,
-            mouse_ever_enabled: false,
             alt: None,
             alt_active: false,
         }
@@ -426,18 +404,15 @@ impl Grid {
                 // notion of falling back to a lesser mode.
                 (true, 1000) => {
                     self.mouse_tracking =
-                        if enable { MouseTracking::Normal } else { MouseTracking::Off };
-                    self.note_mouse_request(enable);
+                        if enable { MouseTracking::Normal } else { MouseTracking::Off }
                 }
                 (true, 1002) => {
                     self.mouse_tracking =
-                        if enable { MouseTracking::ButtonEvent } else { MouseTracking::Off };
-                    self.note_mouse_request(enable);
+                        if enable { MouseTracking::ButtonEvent } else { MouseTracking::Off }
                 }
                 (true, 1003) => {
                     self.mouse_tracking =
-                        if enable { MouseTracking::AnyEvent } else { MouseTracking::Off };
-                    self.note_mouse_request(enable);
+                        if enable { MouseTracking::AnyEvent } else { MouseTracking::Off }
                 }
                 (true, 1006) => {
                     self.mouse_encoding =
@@ -450,34 +425,11 @@ impl Grid {
         }
     }
 
-    /// Records a program's opinion about mouse tracking.
-    ///
-    /// Turning tracking off only counts as declining the wheel if the program
-    /// never asked for it in the first place. tmux's startup is exactly that;
-    /// a curses application handing the mouse back mid-run is not, and must
-    /// keep its arrow keys.
-    ///
-    /// One case stays wrong and cannot be made right from the wire: `set -g
-    /// mouse off` inside a running tmux looks the same as that curses
-    /// application, so the arrows come back for the rest of that session.
-    fn note_mouse_request(&mut self, enable: bool) {
-        if enable {
-            self.mouse_ever_enabled = true;
-        }
-        self.mouse_declined = !enable && !self.mouse_ever_enabled;
-    }
-
     fn set_alt_screen(&mut self, on: bool) {
         if on == self.alt_active {
             return;
         }
         if on {
-            // A new program gets the benefit of the doubt, and is judged on
-            // what it does from here. tmux states its case just after this — it
-            // sends `1049h` first and disables the mouse modes second — so
-            // clearing here does not throw that away.
-            self.mouse_declined = false;
-            self.mouse_ever_enabled = false;
             self.alt = Some((self.cells.clone(), self.cx, self.cy));
             self.cells.fill(Cell::default());
             self.cx = 0;
@@ -1305,66 +1257,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn a_program_that_turns_the_mouse_off_is_saying_so_on_purpose() {
-        // The sequences tmux actually sends as it starts, in the order it sends
-        // them: the alternate screen first, the mouse modes after.
-        let g = feed(20, 3, &["\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"]);
-        assert!(g.alt_active);
-        assert!(g.mouse_declined, "tmux said it does not want the mouse");
-        // A pager says nothing about the mouse, and must keep its arrow keys.
-        let g = feed(20, 3, &["\x1b[?1049h"]);
-        assert!(!g.mouse_declined);
-    }
-
-    #[test]
-    fn turning_the_mouse_back_on_takes_the_refusal_back() {
-        // `set -g mouse on`: tmux resets the modes, then enables them.
-        let g =
-            feed(20, 3, &["\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1006h\x1b[?1000h\x1b[?1002h"]);
-        assert!(!g.mouse_declined);
-        assert_eq!(g.mouse_tracking, MouseTracking::ButtonEvent);
-    }
-
-    #[test]
-    fn each_program_gets_the_benefit_of_the_doubt() {
-        // Leaving tmux and opening a pager must not carry tmux's refusal over.
-        let g = feed(20, 3, &["\x1b[?1049h\x1b[?1000l\x1b[?1002l", "\x1b[?1049l", "\x1b[?1049h"]);
-        assert!(!g.mouse_declined, "the pager never declined anything");
-    }
-
-    #[test]
-    fn giving_the_mouse_back_is_not_the_same_as_never_wanting_it() {
-        // A curses application: mousemask(ALL_MOUSE_EVENTS), then mousemask(0),
-        // still on the alternate screen. Reading that as a refusal left it with
-        // no wheel at all — tracking is off by then, so no report goes out
-        // either, and the arrows were being withheld as well.
-        let g = feed(20, 3, &["\x1b[?1049h\x1b[?1000h\x1b[?1000l"]);
-        assert_eq!(g.mouse_tracking, MouseTracking::Off);
-        assert!(!g.mouse_declined, "the program asked for the mouse before giving it back");
-    }
-
-    #[test]
-    fn tmux_declines_because_it_never_asked() {
-        // The same final tracking state as the test above, reached without ever
-        // enabling anything. That difference is the whole rule.
-        let g = feed(20, 3, &["\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1003l"]);
-        assert_eq!(g.mouse_tracking, MouseTracking::Off);
-        assert!(g.mouse_declined);
-    }
-
-    #[test]
-    fn a_new_program_is_not_judged_by_the_last_ones_habits() {
-        // `mouse_ever_enabled` has to clear with the screen too, or a curses
-        // application would launder tmux's refusal for whatever follows it.
-        let g = feed(
-            20,
-            3,
-            &["\x1b[?1049h\x1b[?1000h\x1b[?1000l", "\x1b[?1049l", "\x1b[?1049h\x1b[?1000l"],
-        );
-        assert!(g.mouse_declined, "the second program never asked for the mouse");
     }
 }
 
