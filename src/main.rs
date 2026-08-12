@@ -810,6 +810,12 @@ impl App {
 
     fn copy_selection(&mut self) {
         let Some(text) = self.selected_text() else { return };
+        self.set_clipboard(text);
+    }
+
+    /// Puts text on the system clipboard, opening it on first use. Shared by the
+    /// copy key and by OSC 52, which is a program asking for the same thing.
+    fn set_clipboard(&mut self, text: String) {
         if self.clipboard.is_none() {
             match arboard::Clipboard::new() {
                 Ok(c) => self.clipboard = Some(c),
@@ -834,6 +840,10 @@ impl App {
     fn pump_all(&mut self, event_loop: &ActiveEventLoop) -> bool {
         let mut dirty = false;
         let mut finished: Vec<PaneId> = Vec::new();
+        // Collected rather than written as we go, because the clipboard is the
+        // app's and we are holding every pane borrowed. Last writer wins, which
+        // is what the clipboard means anyway.
+        let mut clipboard: Option<String> = None;
 
         for (&id, p) in self.panes.iter_mut() {
             let (changed, reply) = p.pump();
@@ -849,6 +859,17 @@ impl App {
                 p.exited = true;
                 finished.push(id);
             }
+            // After the final pump, so an OSC 52 in a program's last breath —
+            // copy and quit is one keystroke in tmux — still lands.
+            if let Some(text) = p.grid.pending_clipboard.take() {
+                clipboard = Some(text);
+            }
+        }
+
+        // Before closing panes: that path can exit the loop, and a copy made on
+        // the way out is still a copy the user asked for.
+        if let Some(text) = clipboard {
+            self.set_clipboard(text);
         }
 
         for id in finished {

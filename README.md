@@ -68,6 +68,26 @@ scrollback while a program owns the pointer.
 
 Everything else is encoded and forwarded to the shell.
 
+## Copying out of tmux over ssh
+
+Once tmux has the mouse, a drag is tmux's, and what it copies goes into a tmux
+paste buffer — which lives on the remote host, not on your Mac. The way back is
+**OSC 52**, the escape sequence a program uses to ask the terminal to set its
+clipboard, and koma honours it. So a copy inside tmux — a mouse drag, or `y` in
+copy mode — lands on the local clipboard and pastes into any other app.
+
+Nothing needs configuring on the remote: tmux's default `set-clipboard external`
+already sends it, and tmux assumes a `xterm*` `TERM` can take it. If it has been
+turned off, `set -s set-clipboard on` puts it back.
+
+Reads are not answered. OSC 52 can also *ask* for the clipboard, and replying
+would hand whatever you last copied to whatever is running on the far end of
+that ssh session, for the asking.
+
+Selecting with the mouse still works too — hold **Shift** and the drag stays
+local, then `Cmd+C`. That copies what koma has on screen, which inside tmux
+means the pane exactly as drawn, dividers, status line and all.
+
 ## Japanese and other IME input
 
 IME input works: composing text appears inline at the caret with the active
@@ -115,7 +135,7 @@ coverage.
 cargo test
 ```
 
-198 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+206 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, resize moving rows to and from
 history and carrying the alternate screen's saved buffer with it,
 SGR including truecolor, alt
@@ -123,7 +143,9 @@ screen, wide characters, DSR replies), selection (word snapping over paths and
 multibyte text, columns after a double-width character, drag direction,
 extraction and padding), paste encoding (bracketed markers, CRLF, defusing
 escape sequences, and an end marker that a single removal pass would splice
-back together), the split tree
+back together), the OSC 52 clipboard (every padding case, wrapped lines,
+truncated and wrong-alphabet payloads rejected rather than half-decoded, and a
+read request going unanswered), the split tree
 (even sizing across repeated splits and across a close-induced collapse,
 non-overlap, directional focus), leader/modifier resolution, sub-line scroll
 accumulation, wheel axis selection, alternate-scroll encoding, mouse
