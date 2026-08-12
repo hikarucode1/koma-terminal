@@ -50,6 +50,48 @@ pub enum CursorShape {
     Underline,
 }
 
+/// A character set that can be mapped into the printable range.
+///
+/// Only two of the VT100's sets matter in practice. `DecGraphics` is the one
+/// tmux and ncurses reach for whenever the terminal isn't in a UTF-8 locale —
+/// which is the normal case over ssh, where the remote often falls back to
+/// `C`/`POSIX` — and without it every box-drawing character arrives as the
+/// ASCII letter it shares a slot with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Charset {
+    Ascii,
+    DecGraphics,
+}
+
+impl Charset {
+    /// DEC Special Graphics occupies `_` through `~`; everything else is ASCII.
+    fn map(self, c: char) -> char {
+        if self == Charset::Ascii || !('_'..='~').contains(&c) {
+            return c;
+        }
+        const GRAPHICS: [char; 32] = [
+            ' ', '◆', '▒', '␉', '␌', '␍', '␊', '°', '±', '␤', '␋', '┘', '┐', '┌', '└', '┼', '⎺',
+            '⎻', '─', '⎼', '⎽', '├', '┤', '┴', '┬', '│', '≤', '≥', 'π', '≠', '£', '·',
+        ];
+        GRAPHICS[c as usize - '_' as usize]
+    }
+}
+
+/// Cursor state saved by DECSC (`ESC 7`) and CSI s, restored by DECRC / CSI u.
+/// The charset belongs here as much as the position does: a program that
+/// switches to line drawing, saves, and restores must come back to the set it
+/// saved, not to whatever is current.
+#[derive(Clone, Copy)]
+struct SavedCursor {
+    cx: usize,
+    cy: usize,
+    fg: Color,
+    bg: Color,
+    flags: u8,
+    charsets: [Charset; 2],
+    gl: usize,
+}
+
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
@@ -73,7 +115,12 @@ pub struct Grid {
     fg: Color,
     bg: Color,
     flags: u8,
-    saved: Option<(usize, usize, Color, Color, u8)>,
+    saved: Option<SavedCursor>,
+
+    /// The G0 and G1 character sets, and which of them SO/SI has mapped into
+    /// the printable range.
+    charsets: [Charset; 2],
+    gl: usize,
 
     /// Scroll region, inclusive rows.
     top: usize,
@@ -108,6 +155,27 @@ pub struct Grid {
     pub alt_active: bool,
 }
 
+/// Moves the top `count` rows of `buf` into `scrollback`, trimming to `max` and
+/// counting whatever is dropped so row ids stay valid.
+fn archive(
+    scrollback: &mut Vec<Vec<Cell>>,
+    trimmed: &mut usize,
+    max: usize,
+    buf: &[Cell],
+    cols: usize,
+    count: usize,
+) {
+    for r in 0..count {
+        let s = r * cols;
+        scrollback.push(buf[s..s + cols].to_vec());
+    }
+    if scrollback.len() > max {
+        let excess = scrollback.len() - max;
+        scrollback.drain(0..excess);
+        *trimmed += excess;
+    }
+}
+
 impl Grid {
     pub fn new(cols: usize, rows: usize) -> Self {
         let cols = cols.max(1);
@@ -128,6 +196,8 @@ impl Grid {
             bg: Color::Default,
             flags: 0,
             saved: None,
+            charsets: [Charset::Ascii; 2],
+            gl: 0,
             top: 0,
             bot: rows - 1,
             wrap_pending: false,
@@ -203,65 +273,71 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        let (old_rows, old_cols) = (self.rows, self.cols);
+        let copy_cols = old_cols.min(cols);
 
-        // Where the surviving window starts when shrinking.
+        // The window a buffer keeps, as `(src_start, keep, dst_start)`.
         //
-        // Take from below the cursor first — those rows are the unused tail of
-        // the screen — and only push from the top for whatever is still needed.
-        // Doing it the other way round sends real output to history while blank
-        // rows sit underneath, which is what a pane with a few lines of output
-        // and a prompt looks like every time you split it.
-        //
-        // The result always keeps the cursor: `cy + 1 - rows` at most, which is
-        // at most `cy`.
-        let shrink_from = if rows < self.rows {
-            let below = self.rows - 1 - self.cy;
-            (self.rows - rows).saturating_sub(below)
-        } else {
-            0
-        };
-
-        // Rows falling off the top are history, not rubbish. Splitting a pane
-        // shrinks it, and without this everything above the fold vanished with
-        // no way to scroll back to it.
-
-        if rows < self.rows && !self.alt_active {
-            for r in 0..shrink_from {
-                let s = r * self.cols;
-                self.scrollback.push(self.cells[s..s + self.cols].to_vec());
-            }
-            if self.scrollback.len() > self.max_scrollback {
-                let excess = self.scrollback.len() - self.max_scrollback;
-                self.scrollback.drain(0..excess);
-                self.trimmed += excess;
-            }
-        }
-
-        // Growing pulls that history back rather than opening blank space
-        // above the cursor, so closing a split undoes what opening it did.
-        let pulled = if rows > self.rows && !self.alt_active {
-            (rows - self.rows).min(self.scrollback.len())
-        } else {
-            0
+        // Rows below the cursor are the unused tail of the screen, so they go
+        // first; the top is only touched for whatever is still needed. Every
+        // buffer is measured against *its own* cursor — the alternate screen's
+        // saved copy of the main screen has a cursor of its own, usually near
+        // the bottom, and judging it by the cursor of whatever is on screen
+        // would cut it off from the top.
+        let window = |cy: usize, pulled: usize| -> (usize, usize, usize) {
+            let src_start = if rows < old_rows {
+                let below = old_rows - 1 - cy.min(old_rows - 1);
+                (old_rows - rows).saturating_sub(below)
+            } else {
+                0
+            };
+            let keep = (old_rows - src_start).min(rows - pulled);
+            (src_start, keep, rows - keep)
         };
 
         // No reflow: the surviving window keeps its old wrapping.
-        let mut next = vec![Cell::default(); cols * rows];
-        let copy_cols = self.cols.min(cols);
-        let src_start = if rows < self.rows { shrink_from } else { 0 };
-        let keep = (self.rows - src_start).min(rows - pulled);
-        let dst_start = rows - keep;
+        let reshape = |old: &[Cell], (src_start, keep, dst_start): (usize, usize, usize)| {
+            let mut next = vec![Cell::default(); cols * rows];
+            for r in 0..keep {
+                for c in 0..copy_cols {
+                    next[(dst_start + r) * cols + c] = old[(src_start + r) * old_cols + c];
+                }
+            }
+            next
+        };
 
-        for r in 0..keep {
-            for c in 0..copy_cols {
-                next[(dst_start + r) * cols + c] = self.cells[(src_start + r) * self.cols + c];
+        // Exactly one buffer is the main screen — the visible one, or the copy
+        // the alternate screen stands in for — and only that one has a history.
+        let saved = self.alt.take();
+        let main_cy = saved.as_ref().map_or(self.cy, |&(_, _, cy)| cy);
+        let pulled = if rows > old_rows && saved.is_none() {
+            (rows - old_rows).min(self.scrollback.len())
+        } else {
+            0
+        };
+        let main_win = window(main_cy, pulled);
+
+        // Rows falling off the top of the main screen are history, not rubbish.
+        // Splitting a pane shrinks it, and without this everything above the
+        // fold vanished with no way to scroll back to it — including when the
+        // main screen is the one parked behind vim.
+        if rows < old_rows && main_win.0 > 0 {
+            let max = self.max_scrollback;
+            let (scrollback, trimmed) = (&mut self.scrollback, &mut self.trimmed);
+            match saved.as_ref() {
+                Some((buf, _, _)) => archive(scrollback, trimmed, max, buf, old_cols, main_win.0),
+                None => archive(scrollback, trimmed, max, &self.cells, old_cols, main_win.0),
             }
         }
-        // The pulled lines sit directly above what was on screen; if history
-        // ran short, the gap is left at the very top.
+
+        let visible_win = if saved.is_some() { window(self.cy, 0) } else { main_win };
+        let mut next = reshape(&self.cells, visible_win);
+
+        // Growing pulls that history back rather than opening blank space above
+        // the cursor, so closing a split undoes what opening it did.
         for i in 0..pulled {
             let row = &self.scrollback[self.scrollback.len() - pulled + i];
-            let dst = (dst_start - pulled + i) * cols;
+            let dst = (main_win.2 - pulled + i) * cols;
             let n = copy_cols.min(row.len());
             next[dst..dst + n].copy_from_slice(&row[..n]);
         }
@@ -270,9 +346,15 @@ impl Grid {
             self.scrollback.truncate(keep_back);
         }
 
+        if let Some((buf, sx, sy)) = saved {
+            let reshaped = reshape(&buf, main_win);
+            let ny = (sy + main_win.2).saturating_sub(main_win.0).min(rows - 1);
+            self.alt = Some((reshaped, sx.min(cols - 1), ny));
+        }
+
         self.cells = next;
         self.cx = self.cx.min(cols - 1);
-        self.cy = (self.cy + dst_start).saturating_sub(src_start).min(rows - 1);
+        self.cy = (self.cy + visible_win.2).saturating_sub(visible_win.0).min(rows - 1);
         self.cols = cols;
         self.rows = rows;
         self.top = 0;
@@ -341,7 +423,35 @@ impl Grid {
         }
     }
 
+    fn save_cursor(&mut self) {
+        self.saved = Some(SavedCursor {
+            cx: self.cx,
+            cy: self.cy,
+            fg: self.fg,
+            bg: self.bg,
+            flags: self.flags,
+            charsets: self.charsets,
+            gl: self.gl,
+        });
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some(s) = self.saved {
+            self.cx = s.cx.min(self.cols - 1);
+            self.cy = s.cy.min(self.rows - 1);
+            self.fg = s.fg;
+            self.bg = s.bg;
+            self.flags = s.flags;
+            self.charsets = s.charsets;
+            self.gl = s.gl;
+        }
+    }
+
     fn put(&mut self, c: char) {
+        // The active character set is applied before anything else: the width
+        // of a box-drawing glyph is the width that matters, not the width of
+        // the ASCII letter that stood in for it on the wire.
+        let c = self.charsets[self.gl].map(c);
         let w = c.width().unwrap_or(1).max(1);
 
         if self.wrap_pending {
@@ -626,6 +736,9 @@ impl vte::Perform for Performer<'_> {
                 g.cx = next.min(g.cols - 1);
             }
             0x07 => g.bell = true,
+            // Shift Out / Shift In: swap which designated set is printable.
+            0x0e => g.gl = 1,
+            0x0f => g.gl = 0,
             _ => {}
         }
     }
@@ -727,16 +840,8 @@ impl vte::Perform for Performer<'_> {
                     g.cy = top;
                 }
             }
-            's' => g.saved = Some((g.cx, g.cy, g.fg, g.bg, g.flags)),
-            'u' => {
-                if let Some((cx, cy, fg, bg, fl)) = g.saved {
-                    g.cx = cx.min(g.cols - 1);
-                    g.cy = cy.min(g.rows - 1);
-                    g.fg = fg;
-                    g.bg = bg;
-                    g.flags = fl;
-                }
-            }
+            's' => g.save_cursor(),
+            'u' => g.restore_cursor(),
             'q' if intermediates.first() == Some(&b' ') => {
                 g.cursor_shape = match flat.first().copied().unwrap_or(0) {
                     3 | 4 => CursorShape::Underline,
@@ -744,20 +849,57 @@ impl vte::Perform for Performer<'_> {
                     _ => CursorShape::Block,
                 };
             }
-            'n' if flat.first() == Some(&6) => {
-                // Device Status Report: report cursor position.
+            // XTVERSION: name ourselves. tmux asks alongside the two device
+            // attributes queries, and takes silence for an answer, but naming
+            // ourselves is both cheap and what it is actually asking for.
+            'q' if intermediates.first() == Some(&b'>') => {
+                self.reply.extend_from_slice(
+                    format!("\x1bP>|koma({})\x1b\\", env!("CARGO_PKG_VERSION")).as_bytes(),
+                );
+            }
+            'n' if !private && flat.first() == Some(&6) => {
+                // Device Status Report: report cursor position. Gated on the
+                // plain form: `CSI ? 6 n` is DECXCPR and wants its own reply, so
+                // answering it with a CPR would be a reply the asker cannot
+                // parse — see the device-attributes note below for where that
+                // ends up.
                 self.reply.extend_from_slice(format!("\x1b[{};{}R", g.cy + 1, g.cx + 1).as_bytes());
             }
-            'c' => self.reply.extend_from_slice(b"\x1b[?6c"), // identify as a VT102
+            'c' => match intermediates.first() {
+                // Primary DA: identify as a VT102.
+                None => self.reply.extend_from_slice(b"\x1b[?6c"),
+                // Secondary DA (`CSI > c`) asks what model and version we are,
+                // and the answer has to be in its own `CSI > ... c` form.
+                //
+                // We used to send the primary reply to both. tmux asks both
+                // questions the moment it starts, could not parse `\x1b[?6c` as
+                // an answer to the second, and did what it does with input it
+                // doesn't recognise: passed it to the pane as keystrokes. So
+                // every tmux session opened with `^[[?6c` echoed at the prompt
+                // and `6c` left on the command line.
+                Some(b'>') => self.reply.extend_from_slice(b"\x1b[>0;0;0c"),
+                _ => {}
+            },
             _ => {}
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        let g = &mut self.grid;
+        // `ESC ( x` designates a set as G0, `ESC ) x` as G1. `0` is DEC Special
+        // Graphics — tmux's pane dividers and every ncurses box outside a UTF-8
+        // locale — and anything else is close enough to ASCII to treat as such.
+        if let Some(slot) = match intermediates.first() {
+            Some(b'(') => Some(0),
+            Some(b')') => Some(1),
+            _ => None,
+        } {
+            g.charsets[slot] = if byte == b'0' { Charset::DecGraphics } else { Charset::Ascii };
+            return;
+        }
         if !intermediates.is_empty() {
             return;
         }
-        let g = &mut self.grid;
         match byte {
             b'D' => g.newline(),
             b'E' => {
@@ -771,16 +913,8 @@ impl vte::Perform for Performer<'_> {
                     g.cy = g.cy.saturating_sub(1);
                 }
             }
-            b'7' => g.saved = Some((g.cx, g.cy, g.fg, g.bg, g.flags)),
-            b'8' => {
-                if let Some((cx, cy, fg, bg, fl)) = g.saved {
-                    g.cx = cx.min(g.cols - 1);
-                    g.cy = cy.min(g.rows - 1);
-                    g.fg = fg;
-                    g.bg = bg;
-                    g.flags = fl;
-                }
-            }
+            b'7' => g.save_cursor(),
+            b'8' => g.restore_cursor(),
             b'c' => {
                 let (cols, rows) = (g.cols, g.rows);
                 **g = Grid::new(cols, rows);
@@ -1271,10 +1405,11 @@ mod tests {
     }
 
     #[test]
-    fn the_alternate_screen_never_feeds_history_on_resize() {
+    fn a_full_screen_programs_own_rows_never_reach_history() {
         // vim and tmux redraw themselves; their frames are not our scrollback.
+        // What the main screen behind them loses off the top still is, which is
+        // why this checks whose rows arrived rather than merely counting them.
         let mut g = feed(20, 4, &["a\r\nb\r\nc"]);
-        let before = g.scrollback.len();
         let mut parser = vte::Parser::new();
         {
             let mut perf = Performer { grid: &mut g, reply: Vec::new() };
@@ -1282,9 +1417,15 @@ mod tests {
             parser.advance(&mut perf, b"x\r\ny\r\nz");
         }
         g.resize(20, 2);
-        assert_eq!(g.scrollback.len(), before, "alt-screen rows leaked into history");
         g.resize(20, 4);
-        assert_eq!(g.scrollback.len(), before);
+        let history: Vec<String> = g
+            .scrollback
+            .iter()
+            .map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect();
+        for frame in ["x", "y", "z"] {
+            assert!(!history.contains(&frame.to_string()), "{frame:?} leaked into {history:?}");
+        }
     }
 
     #[test]
@@ -1366,6 +1507,191 @@ mod tests {
     }
 
     #[test]
+    fn dec_line_drawing_turns_letters_into_box_characters() {
+        // Without a UTF-8 locale — the usual state of a machine reached over
+        // ssh — tmux draws its pane dividers this way, and they arrived as
+        // literal rows of `q`.
+        let g = feed(10, 2, &["\x1b(0qqqxlk\x1b(Bqx"]);
+        assert_eq!(row_text(&g, 0), "───│┌┐qx");
+    }
+
+    #[test]
+    fn shift_out_selects_the_other_charset() {
+        // G1 holds the graphics set; SO maps it in, SI takes it back out.
+        let g = feed(10, 2, &["\x1b)0a\x0eq\x0fq"]);
+        assert_eq!(row_text(&g, 0), "a─q");
+    }
+
+    #[test]
+    fn the_saved_cursor_carries_its_charset() {
+        // Save while drawing boxes, print ASCII, restore: `q` must be a line
+        // again, not the letter.
+        let g = feed(10, 2, &["\x1b(0\x1b7\x1b(Bx\x1b8q"]);
+        assert_eq!(row_text(&g, 0), "─", "the restore did not bring the charset back");
+    }
+
+    #[test]
+    fn a_charset_switch_does_not_cancel_a_pending_wrap() {
+        let g = feed(4, 3, &["abcd", "\x1b(0", "q"]);
+        assert_eq!(row_text(&g, 0), "abcd");
+        assert_eq!(row_text(&g, 1), "─");
+    }
+
+    /// Runs `input` and returns whatever the terminal wants to send back.
+    fn reply_to(input: &[u8]) -> Vec<u8> {
+        let mut g = Grid::new(20, 5);
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, input);
+        perf.reply
+    }
+
+    #[test]
+    fn the_two_device_attributes_queries_get_their_own_answers() {
+        // The regression. tmux asks both the moment it starts. Answering the
+        // secondary query with the primary reply gave tmux something it could
+        // not parse, and tmux hands unparsed input to the pane — so every
+        // session began with `^[[?6c` echoed and `6c` typed at the prompt.
+        assert_eq!(reply_to(b"\x1b[c"), b"\x1b[?6c");
+        assert_eq!(reply_to(b"\x1b[0c"), b"\x1b[?6c");
+        assert_eq!(reply_to(b"\x1b[>c"), b"\x1b[>0;0;0c");
+        assert_eq!(reply_to(b"\x1b[>0c"), b"\x1b[>0;0;0c");
+    }
+
+    #[test]
+    fn a_secondary_attributes_reply_is_never_a_primary_one() {
+        // Stated as the property rather than the byte string: whatever we grow
+        // into, the two replies must stay tellable apart by their asker.
+        let secondary = reply_to(b"\x1b[>c");
+        assert!(secondary.starts_with(b"\x1b[>"), "tmux looks for CSI > here");
+        assert_ne!(secondary, reply_to(b"\x1b[c"));
+    }
+
+    #[test]
+    fn a_cursor_report_answers_only_the_query_that_asked_for_it() {
+        assert_eq!(reply_to(b"\x1b[3;7H\x1b[6n"), b"\x1b[3;7R");
+        // DECXCPR wants a `CSI ? ... R`. Saying nothing is better than saying
+        // something the asker will feed to the shell as keystrokes.
+        assert!(reply_to(b"\x1b[3;7H\x1b[?6n").is_empty());
+        // The mode query tmux sends looking for a light/dark answer.
+        assert!(reply_to(b"\x1b[?996n").is_empty());
+    }
+
+    #[test]
+    fn xtversion_names_the_terminal() {
+        let r = reply_to(b"\x1b[>0q");
+        let s = String::from_utf8_lossy(&r);
+        assert!(s.starts_with("\x1bP>|koma("), "unexpected XTVERSION reply: {s:?}");
+        assert!(s.ends_with("\x1b\\"), "XTVERSION must be ST-terminated: {s:?}");
+    }
+
+    #[test]
+    fn setting_the_cursor_style_still_works() {
+        // `CSI Ps SP q` shares its final byte with XTVERSION, so the two must
+        // not be confused for each other.
+        let g = feed(10, 3, &["\x1b[5 q"]);
+        assert!(matches!(g.cursor_shape, CursorShape::Bar));
+        assert!(reply_to(b"\x1b[5 q").is_empty());
+    }
+
+    #[test]
+    fn splitting_while_a_full_screen_program_runs_keeps_the_shell_behind_it() {
+        // Reported in review of #12: resize() left the saved main screen at its
+        // old size, so the size guard in set_alt_screen blanked it on the way
+        // out. Opening vim, splitting the pane, then quitting wiped the shell.
+        let mut g = feed(20, 6, &["shell1\r\nshell2\r\nshell3"]);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+            parser.advance(&mut perf, b"vim-a\r\nvim-b");
+        }
+        g.resize(20, 4);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        assert!(!g.alt_active);
+        let shown: Vec<String> = (0..4).map(|y| row_text(&g, y)).collect();
+        assert_eq!(shown, vec!["shell1", "shell2", "shell3", ""]);
+    }
+
+    #[test]
+    fn the_saved_screen_survives_growing_as_well_as_shrinking() {
+        let mut g = feed(20, 4, &["a\r\nb"]);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 8);
+        g.resize(30, 8);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        let shown: Vec<String> = (0..8).map(|y| row_text(&g, y)).collect();
+        assert!(shown.contains(&"a".to_string()) && shown.contains(&"b".to_string()), "{shown:?}");
+    }
+
+    #[test]
+    fn the_cursor_behind_a_full_screen_program_comes_back_in_range() {
+        let mut g = feed(20, 6, &["one\r\ntwo\r\nthree"]);
+        let (cx, cy) = (g.cx, g.cy);
+        assert_eq!((cx, cy), (5, 2));
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 3);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+        assert!(g.cy < 3, "cursor at {} in a 3-row screen", g.cy);
+        assert_eq!(row_text(&g, g.cy), "three", "the cursor left its line");
+    }
+
+    #[test]
+    fn a_full_shell_screen_behind_vim_survives_a_split_intact() {
+        // Reported in review of #13: the saved main screen was cut to a window
+        // measured against *vim's* cursor, which sits at the top. The shell's
+        // own cursor is at the bottom, so its screen lost the prompt and the
+        // eleven rows above it — and they were not in the scrollback either.
+        let mut g = Grid::new(20, 24);
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            for i in 1..=23 {
+                parser.advance(&mut perf, format!("l{i}\r\n").as_bytes());
+            }
+            parser.advance(&mut perf, b"$ ");
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        g.resize(20, 12);
+        {
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+
+        assert_eq!(row_text(&g, g.cy), "$", "the prompt must come back with the shell");
+        assert_eq!(
+            (0..12).map(|y| row_text(&g, y)).collect::<Vec<_>>(),
+            (13..=23).map(|i| format!("l{i}")).chain(["$".to_string()]).collect::<Vec<_>>()
+        );
+
+        // And nothing went missing on the way: every line is still reachable.
+        let reachable: Vec<String> = (0..g.trimmed + g.scrollback.len() + g.rows)
+            .filter_map(|abs| g.row_at(abs))
+            .map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect();
+        for i in 1..=23 {
+            assert!(reachable.contains(&format!("l{i}")), "l{i} was lost behind vim");
+        }
+    }
+
+    #[test]
     fn osc_52_carries_multibyte_text() {
         // 日本語 as base64. Nothing about the payload is per-character, so this
         // is really a check that we decode bytes and only then read them as text.
@@ -1425,6 +1751,45 @@ mod tests {
         assert!(decode_base64(b"YWJj$").is_none());
         // URL-safe base64 is a different alphabet; rejecting beats mangling.
         assert!(decode_base64(b"a-b_").is_none());
+    }
+
+    #[test]
+    fn a_split_behind_vim_matches_a_split_without_it() {
+        // The invariant #12 established must not lapse just because a
+        // full-screen program happens to be in front.
+        let build = || {
+            let mut g = Grid::new(20, 24);
+            let mut parser = vte::Parser::new();
+            let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+            for i in 1..=23 {
+                parser.advance(&mut perf, format!("l{i}\r\n").as_bytes());
+            }
+            parser.advance(&mut perf, b"$ ");
+            drop(perf);
+            g
+        };
+
+        let mut plain = build();
+        plain.resize(20, 12);
+
+        let mut behind = build();
+        let mut parser = vte::Parser::new();
+        {
+            let mut perf = Performer { grid: &mut behind, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049h");
+        }
+        behind.resize(20, 12);
+        {
+            let mut perf = Performer { grid: &mut behind, reply: Vec::new() };
+            parser.advance(&mut perf, b"\x1b[?1049l");
+        }
+
+        assert_eq!(
+            (0..12).map(|y| row_text(&behind, y)).collect::<Vec<_>>(),
+            (0..12).map(|y| row_text(&plain, y)).collect::<Vec<_>>(),
+        );
+        assert_eq!(behind.scrollback.len(), plain.scrollback.len());
+        assert_eq!(behind.cy, plain.cy);
     }
 }
 
