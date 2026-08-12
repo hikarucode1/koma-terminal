@@ -119,7 +119,7 @@ coverage.
 cargo test
 ```
 
-190 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+194 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, resize moving rows to and from
 history, SGR including truecolor, alt
 screen, wide characters, DSR replies), selection (word snapping over paths and
