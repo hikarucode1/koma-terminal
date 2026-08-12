@@ -467,9 +467,17 @@ impl App {
     /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
     /// back through history.
     ///
-    /// A no-op on the alternate screen: a full-screen application owns the
-    /// whole viewport and we keep no scrollback for it, so there is nothing to
-    /// move. Wheel input gets special treatment — see `wheel_scroll`.
+    /// Not a no-op on the alternate screen, though it reads like one should be:
+    /// the scrollback a full-screen program was started in front of is still
+    /// there — we stop adding to it, we never clear it — and `view_row` does not
+    /// ask whether the alternate screen is up. So a non-zero `view_offset` here
+    /// paints that older history over the running program, which is what
+    /// Shift+wheel is *for*, and a trap for anything that scrolls a pane
+    /// without meaning to show it.
+    ///
+    /// It does not repair itself either: the reset that follows new output is
+    /// gated on the main screen (`scroll_up` in grid.rs), so the program's own
+    /// redraws leave it alone until `view_offset` comes back to zero.
     fn scroll_pane(&mut self, id: PaneId, lines: isize) {
         let Some(p) = self.panes.get_mut(&id) else { return };
         if lines == 0 {

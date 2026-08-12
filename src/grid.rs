@@ -228,6 +228,12 @@ impl Grid {
 
     /// Row `y` of the current viewport, accounting for scrollback offset.
     /// Returns `None` for rows that predate the retained scrollback.
+    ///
+    /// Deliberately blind to the alternate screen. Scrollback outlives the
+    /// switch, so scrolling back while a full-screen program is up shows what
+    /// was on screen before it started — the thing Shift+wheel exists to do.
+    /// Callers that move `view_offset` for some other reason are covering the
+    /// program's display, and should be sure that is what they meant.
     pub fn view_row(&self, y: usize) -> Option<&[Cell]> {
         if self.view_offset == 0 {
             let s = y * self.cols;
