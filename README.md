@@ -129,6 +129,14 @@ fallbacks. A character is drawn by the first face whose charmap covers it, which
 is what makes Japanese and box-drawing characters work when the mono font has no
 coverage.
 
+Which character gets asked for is a separate question. Outside a UTF-8 locale —
+the usual state of a machine reached over ssh, where the remote often falls back
+to `C` — a program draws boxes by switching to DEC Special Graphics (`ESC ( 0`)
+and sending the ASCII letters that share those slots. tmux draws every pane
+divider that way. Both designated sets are tracked, with SO/SI choosing between
+them, and the mapping happens before the width lookup: the width that matters is
+the box glyph's, not that of the letter standing in for it on the wire.
+
 ## Tested
 
 ```sh
@@ -137,24 +145,25 @@ cargo test
 
 206 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, resize moving rows to and from
-history and carrying the alternate screen's saved buffer with it,
-SGR including truecolor, alt
-screen, wide characters, DSR replies), selection (word snapping over paths and
-multibyte text, columns after a double-width character, drag direction,
-extraction and padding), paste encoding (bracketed markers, CRLF, defusing
-escape sequences, and an end marker that a single removal pass would splice
-back together), the OSC 52 clipboard (every padding case, wrapped lines,
-truncated and wrong-alphabet payloads rejected rather than half-decoded, and a
-read request going unanswered), the split tree
-(even sizing across repeated splits and across a close-induced collapse,
-non-overlap, directional focus), leader/modifier resolution, sub-line scroll
-accumulation, wheel axis selection, alternate-scroll encoding, mouse
-reporting (SGR and legacy encodings, which events each tracking mode wants,
-the legacy column ceiling), IME
-composition layout (wrapping, kana taking two columns, active-segment byte
-ranges, caret tracking, and which pane a composition commits into), font
-rasterisation and the atlas, and real pty behaviour (a shell's output
-round-tripping, `stty size` seeing the right dimensions, EOF on exit).
+history and carrying the alternate screen's saved buffer with it, SGR including
+truecolor, alt screen, wide characters, DEC line drawing and the charset a saved
+cursor restores, and the replies — cursor position, the two device attributes
+queries kept apart, XTVERSION — including the queries that go deliberately
+unanswered), selection (word snapping over paths and multibyte text, columns
+after a double-width character, drag direction, extraction and padding), paste
+encoding (bracketed markers, CRLF, defusing escape sequences, and an end marker
+that a single removal pass would splice back together), the OSC 52 clipboard
+(every padding case, wrapped lines, truncated and wrong-alphabet payloads
+rejected rather than half-decoded, and a read request going unanswered), the
+split tree (even sizing across repeated splits and across a close-induced
+collapse, non-overlap, directional focus), leader/modifier resolution, sub-line
+scroll accumulation, wheel axis selection, alternate-scroll encoding, mouse
+reporting (SGR and legacy encodings, which events each tracking mode wants, the
+legacy column ceiling), IME composition layout (wrapping, kana taking two
+columns, active-segment byte ranges, caret tracking, and which pane a
+composition commits into), font rasterisation and the atlas, and real pty
+behaviour (a shell's output round-tripping, `stty size` seeing the right
+dimensions, EOF on exit).
 
 The GPU path itself is not covered by tests — it needs a display.
 
