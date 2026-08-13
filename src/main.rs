@@ -76,6 +76,13 @@ impl PaneState {
         if bytes.is_empty() {
             return (false, Vec::new());
         }
+        // Before the bytes, not after. Output arriving now is the shell's — its
+        // "Killed" line and a fresh prompt — and the prompt is where a shell
+        // re-arms the modes it owns. Clearing first lets those land on top;
+        // clearing afterwards would wipe them.
+        if self.pty.foreground_returned_to_shell() {
+            self.grid.soft_reset();
+        }
         let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };
         self.parser.advance(&mut perf, &bytes);
         let reply = std::mem::take(&mut perf.reply);

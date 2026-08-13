@@ -57,6 +57,14 @@ pub struct Pty {
     dead: Arc<AtomicBool>,
     cols: u16,
     rows: u16,
+    /// The shell's pid, which is also the id of its process group: it is
+    /// spawned into a new session on the slave, so it leads its own group and
+    /// every job it starts gets a group of its own.
+    shell_pgid: Option<i32>,
+    /// Whether the shell held the terminal at the last look. Starts true —
+    /// nothing has run yet — so the first check cannot report a handover that
+    /// never happened.
+    shell_in_front: bool,
 }
 
 impl Pty {
@@ -116,7 +124,64 @@ impl Pty {
             wake();
         });
 
-        Ok(Pty { master: pair.master, writer, rx, child, dead, cols, rows })
+        let shell_pgid = child.process_id().map(|pid| pid as i32);
+
+        Ok(Pty {
+            master: pair.master,
+            writer,
+            rx,
+            child,
+            dead,
+            cols,
+            rows,
+            shell_pgid,
+            shell_in_front: true,
+        })
+    }
+
+    /// The process group the kernel currently gives the terminal to. `None`
+    /// where the platform has no such notion, or when the pty is gone.
+    #[cfg(unix)]
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        self.master.process_group_leader()
+    }
+
+    #[cfg(not(unix))]
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        None
+    }
+
+    /// The shell's own process group id, for comparing against `foreground_pgid`.
+    /// The production path compares the two inside
+    /// `foreground_returned_to_shell`; this is for tests that want to see them
+    /// separately.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn shell_pgid(&self) -> Option<i32> {
+        self.shell_pgid
+    }
+
+    /// True once each time the shell takes the terminal back, which is the
+    /// kernel's own answer to "the foreground program has finished".
+    ///
+    /// Worth going to the kernel for because it does not depend on the program
+    /// behaving. A program that is killed cleans nothing up and says nothing on
+    /// the wire, but it still loses the terminal, and `tcgetpgrp` still says
+    /// so. Callers use it to undo what the program left set — see
+    /// `Grid::soft_reset`.
+    ///
+    /// Silent where the shell runs without job control (`set +m`, or a
+    /// non-interactive shell): jobs then share the shell's own group, so there
+    /// is no handover to see and this never fires. That is the old behaviour,
+    /// not a new failure.
+    pub fn foreground_returned_to_shell(&mut self) -> bool {
+        let Some(shell) = self.shell_pgid else { return false };
+        // No answer is not the same as "someone else has it": leave the last
+        // reading in place rather than inventing a handover on the way back.
+        let Some(front) = self.foreground_pgid() else { return false };
+        let now_shell = front == shell;
+        let returned = now_shell && !self.shell_in_front;
+        self.shell_in_front = now_shell;
+        returned
     }
 
     /// Drains everything buffered without blocking.
@@ -208,6 +273,61 @@ mod tests {
         }
         pty.kill();
         assert!(out.contains("30 100"), "stty reported: {out:?}");
+    }
+
+    /// Polls `f` until it holds, or gives up. Real shells take their time
+    /// starting, so every wait here is generous rather than tuned.
+    fn wait_until(pty: &mut Pty, deadline: Duration, mut f: impl FnMut(&mut Pty) -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            let _ = pty.read_available();
+            if f(pty) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn the_shell_leads_its_own_process_group() {
+        // The premise the handover check rests on: the shell is spawned into a
+        // new session on the slave, so it leads a group whose id is its pid,
+        // and it holds the terminal whenever nothing else is running.
+        let mut pty = Pty::spawn(80, 24, || {}).expect("could not open a pty");
+        let shell = pty.shell_pgid().expect("the shell should have a pid");
+        let settled =
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_pgid() == Some(shell));
+        let front = pty.foreground_pgid();
+        pty.kill();
+        assert!(settled, "the shell should hold the terminal at its prompt, but {front:?} did");
+    }
+
+    #[test]
+    fn a_killed_foreground_job_still_hands_the_terminal_back() {
+        // The case behind issue #19. The job dies by SIGKILL, so it sends no
+        // escape sequence to say it is done — nothing on the wire marks the
+        // end. The kernel moves the terminal back regardless, which is the
+        // whole reason this is asked of the kernel and not of the byte stream.
+        let mut pty = Pty::spawn(80, 24, || {}).expect("could not open a pty");
+        let shell = pty.shell_pgid().expect("the shell should have a pid");
+        assert!(
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_pgid() == Some(shell)),
+            "the shell never reached a prompt"
+        );
+
+        pty.write(b"sh -c 'sleep 1; kill -9 $$'\n");
+        let took_over = wait_until(&mut pty, Duration::from_secs(20), |p| {
+            p.foreground_pgid().is_some_and(|f| f != shell)
+        });
+        assert!(took_over, "job control should give the job a group of its own");
+        // Consumed by the polling above, which is exactly how `pump` uses it.
+        assert!(!pty.foreground_returned_to_shell(), "the job is still running");
+
+        let handed_back =
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_returned_to_shell());
+        pty.kill();
+        assert!(handed_back, "the shell should get the terminal back from a killed job");
     }
 
     #[test]

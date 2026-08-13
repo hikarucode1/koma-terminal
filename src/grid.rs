@@ -57,7 +57,7 @@ pub enum CursorShape {
 /// which is the normal case over ssh, where the remote often falls back to
 /// `C`/`POSIX` — and without it every box-drawing character arrives as the
 /// ASCII letter it shares a slot with.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Charset {
     Ascii,
     DecGraphics,
@@ -224,6 +224,46 @@ impl Grid {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn cell(&self, x: usize, y: usize) -> &Cell {
         &self.cells[self.idx(x, y)]
+    }
+
+    /// Puts back the modes a foreground program owns, leaving what is on the
+    /// screen alone. What `reset(1)` is for, minus the repaint.
+    ///
+    /// Called when a program stops being the foreground one, because nothing
+    /// else puts these back. A program that is killed sends no `1000l`, no
+    /// `1049l` and no `SGR 0`, so without this its settings outlive it for as
+    /// long as the pane does: the mouse keeps writing `\x1b[<0;12;5M` at the
+    /// shell, line drawing turns output into rows of `q`, and a scroll region
+    /// leaves most of the screen frozen.
+    ///
+    /// Every mode here is one a program re-establishes for itself when it
+    /// starts, which is what makes clearing it safe. `wrap_pending` rides along
+    /// for the same reason: it is a half-finished character position, and the
+    /// shell's first character should not inherit it.
+    ///
+    /// Three deliberate omissions, all state somebody else owns:
+    ///
+    /// - **Bracketed paste (2004)** belongs to the shell, which sets it at each
+    ///   prompt. Clearing it here is a race we gain nothing by entering.
+    /// - **Cursor shape** is commonly set once from a startup file, so it would
+    ///   not come back until the next login.
+    /// - **The alternate screen** stays where it is. Forcing the main screen
+    ///   back would throw away the last thing the program drew, and xterm
+    ///   leaves it alone too.
+    pub fn soft_reset(&mut self) {
+        self.mouse_tracking = MouseTracking::Off;
+        self.mouse_encoding = MouseEncoding::Legacy;
+        self.alternate_scroll = true;
+        self.app_cursor_keys = false;
+        self.cursor_visible = true;
+        self.charsets = [Charset::Ascii; 2];
+        self.gl = 0;
+        self.top = 0;
+        self.bot = self.rows - 1;
+        self.fg = Color::Default;
+        self.bg = Color::Default;
+        self.flags = 0;
+        self.wrap_pending = false;
     }
 
     /// Row `y` of the current viewport, accounting for scrollback offset.
@@ -1001,6 +1041,66 @@ mod tests {
         assert_eq!(g.scrollback.len(), 1);
         let first: String = g.scrollback[0].iter().map(|c| c.c).collect();
         assert_eq!(first.trim_end(), "one");
+    }
+
+    /// Everything a program is expected to set, set at once — the state a
+    /// program that gets killed leaves behind.
+    fn a_program_that_took_everything() -> Grid {
+        feed(
+            20,
+            6,
+            &[
+                // Enough to push two lines into scrollback before the program
+                // starts, so "the display is untouched" has something to say.
+                "b1\r\nb2\r\nb3\r\nb4\r\nb5\r\nb6\r\nb7\r\n",
+                "\x1b[?1049h",  // alternate screen
+                "\x1b[?1002h",  // mouse tracking
+                "\x1b[?1006h",  // SGR mouse encoding
+                "\x1b[?1007l",  // declines alternate scroll
+                "\x1b[?1h",     // application cursor keys
+                "\x1b[?25l",    // hides the cursor
+                "\x1b[?2004h",  // bracketed paste
+                "\x1b[5 q",     // bar cursor
+                "\x1b(0",       // G0 to line drawing
+                "\x1b[2;5r",    // a scroll region
+                "\x1b[7mdrawn", // inverse video, and something on screen
+            ],
+        )
+    }
+
+    #[test]
+    fn a_soft_reset_puts_back_what_a_program_owned() {
+        let mut g = a_program_that_took_everything();
+        g.soft_reset();
+
+        assert_eq!(g.mouse_tracking, MouseTracking::Off, "the mouse stops writing at the shell");
+        assert_eq!(g.mouse_encoding, MouseEncoding::Legacy);
+        assert!(g.alternate_scroll, "later programs get the wheel as arrows again");
+        assert!(!g.app_cursor_keys);
+        assert!(g.cursor_visible, "a hidden cursor has to come back");
+        assert_eq!(g.charsets, [Charset::Ascii; 2], "or the shell prints rows of q");
+        assert_eq!(g.gl, 0);
+        assert_eq!((g.top, g.bot), (0, g.rows - 1), "the whole screen scrolls again");
+        assert_eq!((g.fg, g.bg, g.flags), (Color::Default, Color::Default, 0));
+    }
+
+    #[test]
+    fn a_soft_reset_leaves_alone_what_a_program_did_not_own() {
+        let mut g = a_program_that_took_everything();
+        let screen: Vec<char> = g.cells.iter().map(|c| c.c).collect();
+        g.soft_reset();
+
+        // The shell's, set at every prompt — clearing it just ahead of one is a
+        // race with nothing to win.
+        assert!(g.bracketed_paste);
+        // Usually set once from a startup file, so it would not come back.
+        assert!(matches!(g.cursor_shape, CursorShape::Bar));
+        // Forcing the main screen back would discard the last thing drawn, and
+        // xterm does not do it either.
+        assert!(g.alt_active);
+        // This is a reset of modes, not of the display.
+        assert_eq!(g.cells.iter().map(|c| c.c).collect::<Vec<_>>(), screen);
+        assert_eq!(g.scrollback.len(), 2, "history from before the program is still there");
     }
 
     #[test]
