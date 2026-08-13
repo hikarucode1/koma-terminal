@@ -31,7 +31,7 @@ use gpu::{FrameStatus, Gpu, Inst};
 use grid::{
     Cell, Color, CursorShape, FLAG_BOLD, FLAG_INVERSE, FLAG_UNDERLINE, FLAG_WIDE_SPACER, Grid,
 };
-use mouse::{Button as MouseBtn, Event as MouseEv, Mods as MouseMods};
+use mouse::{Button as MouseBtn, Event as MouseEv, Mods as MouseMods, Tracking as MouseTracking};
 use pane::{Axis, Node, PaneId, Rect};
 use pty::Pty;
 use selection::{Mode as SelMode, Point, Selection};
@@ -467,9 +467,19 @@ impl App {
     /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
     /// back through history.
     ///
-    /// A no-op on the alternate screen: a full-screen application owns the
-    /// whole viewport and we keep no scrollback for it, so there is nothing to
-    /// move. Wheel input gets special treatment — see `wheel_scroll`.
+    /// **Not** a no-op on the alternate screen. Scrollback survives the switch —
+    /// `grid.rs` only stops *pushing* to it while `alt_active` — so this walks
+    /// up into whatever the shell printed before the program started, drawing
+    /// it over the program's own screen. That is the documented behaviour of
+    /// Shift+wheel, but it means an unwanted call here is visible damage: the
+    /// cursor disappears (`show_cursor` wants `view_offset == 0`) and the
+    /// program's own repaints will not undo it, because the `scroll_up` branch
+    /// that resets `view_offset` is closed while `alt_active`. Within the
+    /// program's lifetime only a call that brings `view_offset` back to 0
+    /// restores its screen; otherwise the damage lasts until `set_alt_screen`
+    /// zeroes the offset on the way out.
+    ///
+    /// Wheel input gets special treatment — see `wheel_scroll`.
     fn scroll_pane(&mut self, id: PaneId, lines: isize) {
         let Some(p) = self.panes.get_mut(&id) else { return };
         if lines == 0 {
@@ -487,25 +497,25 @@ impl App {
     /// here too would make `Shift+PageUp` move an application's *cursor*
     /// instead of its view, and a page's worth of arrows is not a page anyway.
     ///
-    /// Unconditional only because no mouse reporting exists yet (no DECSET
-    /// 1000/1002/1003/1006 in grid.rs). When that lands, an application with
-    /// tracking enabled must receive mouse sequences instead, and xterm
-    /// additionally gates the arrow-key fallback on DECSET 1007.
+    /// The fallback path: called only after `report_mouse` declined to send
+    /// anything. `wheel_action` decides which kind of decline that was.
     fn wheel_scroll(&mut self, id: PaneId, lines: isize, shift: bool) {
         if lines == 0 {
             return;
         }
+        let Some(p) = self.panes.get(&id) else { return };
         // 1007 off means the program has said not to synthesise arrows, which
         // is what tmux does once it handles the mouse itself.
-        let arrows_allowed =
-            self.panes.get(&id).is_some_and(|p| p.grid.alt_active && p.grid.alternate_scroll);
-        if wheel_action(shift, arrows_allowed) == WheelAction::Viewport {
-            self.scroll_pane(id, lines);
-            return;
+        let arrows_allowed = p.grid.alt_active && p.grid.alternate_scroll;
+        match wheel_action(shift, p.grid.mouse_tracking, arrows_allowed) {
+            WheelAction::Viewport => self.scroll_pane(id, lines),
+            WheelAction::Ignore => {}
+            WheelAction::Application => {
+                let Some(p) = self.panes.get_mut(&id) else { return };
+                let bytes = alternate_scroll_bytes(lines, p.grid.app_cursor_keys);
+                p.pty.write(&bytes);
+            }
         }
-        let Some(p) = self.panes.get_mut(&id) else { return };
-        let bytes = alternate_scroll_bytes(lines, p.grid.app_cursor_keys);
-        p.pty.write(&bytes);
     }
 
     fn scroll_focused(&mut self, lines: isize) {
@@ -1221,6 +1231,8 @@ enum WheelAction {
     Viewport,
     /// Hand it to the program as arrow keys (xterm's alternate scroll).
     Application,
+    /// Drop the tick. Nothing is sent and nothing moves.
+    Ignore,
 }
 
 /// Shift is the standard escape hatch: it always drives our viewport and never
@@ -1228,10 +1240,26 @@ enum WheelAction {
 /// the alternate screen — replays arrow keys into the command line instead of
 /// scrolling, which is what the arrows mean to a line editor.
 ///
+/// Reached only once a mouse report has already failed to go out, and
+/// `tracking` is what tells the two reasons for that apart. Off means the
+/// program never asked for the mouse, so the wheel is ours. Anything else means
+/// it did ask and we could not answer — the pointer resolved to no cell at all
+/// (window margin, the gap between panes) or legacy encoding ran out of room
+/// past column 223. Those ticks are dropped: synthesising arrows would type
+/// into a program that never wanted keys, and falling through to the viewport
+/// would paint pre-program scrollback over its screen (see `scroll_pane`).
+/// xterm drops them too.
+///
 /// `arrows_allowed` is the alternate screen *and* DECSET 1007 still set: a
 /// program that handles the mouse itself turns 1007 off to decline them.
-fn wheel_action(shift: bool, arrows_allowed: bool) -> WheelAction {
-    if shift || !arrows_allowed { WheelAction::Viewport } else { WheelAction::Application }
+fn wheel_action(shift: bool, tracking: MouseTracking, arrows_allowed: bool) -> WheelAction {
+    if shift {
+        return WheelAction::Viewport;
+    }
+    if tracking != MouseTracking::Off {
+        return WheelAction::Ignore;
+    }
+    if arrows_allowed { WheelAction::Application } else { WheelAction::Viewport }
 }
 
 /// Arrow keys an application should see for `lines` of wheel scrolling on the
@@ -2030,16 +2058,18 @@ mod tests {
         assert!(row <= rows, "anchor row {row} should be at most {rows}");
     }
 
+    const NO_MOUSE: MouseTracking = MouseTracking::Off;
+
     #[test]
     fn the_wheel_scrolls_our_viewport_on_the_main_screen() {
-        assert_eq!(wheel_action(false, false), WheelAction::Viewport);
-        assert_eq!(wheel_action(true, false), WheelAction::Viewport);
+        assert_eq!(wheel_action(false, NO_MOUSE, false), WheelAction::Viewport);
+        assert_eq!(wheel_action(true, NO_MOUSE, false), WheelAction::Viewport);
     }
 
     #[test]
     fn the_wheel_reaches_the_application_on_the_alternate_screen() {
         // less and man have no scrollback of ours, so the wheel drives them.
-        assert_eq!(wheel_action(false, true), WheelAction::Application);
+        assert_eq!(wheel_action(false, NO_MOUSE, true), WheelAction::Application);
     }
 
     #[test]
@@ -2047,7 +2077,31 @@ mod tests {
         // Reported from real use: inside tmux the arrow keys alternate scroll
         // sends land in the command line instead of scrolling. Shift is the
         // escape hatch, and it must win on the alternate screen too.
-        assert_eq!(wheel_action(true, true), WheelAction::Viewport);
+        assert_eq!(wheel_action(true, NO_MOUSE, true), WheelAction::Viewport);
+        assert_eq!(wheel_action(true, MouseTracking::ButtonEvent, true), WheelAction::Viewport);
+    }
+
+    #[test]
+    fn a_tracking_program_gets_no_arrows_when_the_report_could_not_be_sent() {
+        // The bug: pointing at the 2px gap between panes, or the window
+        // margin, resolves to no cell, so no report goes out — and the old
+        // condition read that as "the program did not want the mouse" and
+        // typed arrow keys into it. tmux with `set -g mouse on` rewrote the
+        // command line as the wheel turned.
+        for tracking in [MouseTracking::Normal, MouseTracking::ButtonEvent, MouseTracking::AnyEvent]
+        {
+            assert_eq!(wheel_action(false, tracking, true), WheelAction::Ignore);
+        }
+    }
+
+    #[test]
+    fn a_tracking_program_is_not_scrolled_over_either() {
+        // Dropping the tick, not falling back to the viewport: `scroll_pane`
+        // is not a no-op on the alternate screen — it walks up into the
+        // scrollback the shell left behind and paints it over the program.
+        // 1007 off (no arrows) and the main screen are both still Ignore
+        // while tracking is on.
+        assert_eq!(wheel_action(false, MouseTracking::ButtonEvent, false), WheelAction::Ignore);
     }
 
     const END: &str = "\x1b[201~";
