@@ -228,6 +228,13 @@ impl Grid {
 
     /// Row `y` of the current viewport, accounting for scrollback offset.
     /// Returns `None` for rows that predate the retained scrollback.
+    ///
+    /// Deliberately blind to the alternate screen: a non-zero `view_offset`
+    /// draws history over a running full-screen program, which is what
+    /// Shift+wheel is for. Scrollback survives the switch, and still grows
+    /// during it — `resize` archives rows of the saved main screen when a pane
+    /// shrinks while a program is up. What it does *not* contain is the
+    /// screenful the program replaced: that is in `alt`, out of reach.
     pub fn view_row(&self, y: usize) -> Option<&[Cell]> {
         if self.view_offset == 0 {
             let s = y * self.cols;
@@ -243,6 +250,15 @@ impl Grid {
             let s = sy * self.cols;
             self.cells.get(s..s + self.cols)
         }
+    }
+
+    /// Moves the viewport `lines` back through history, clamped to what is
+    /// retained. `view_row` says what that shows while a full-screen program
+    /// is up, which is not nothing.
+    pub fn scroll_view(&mut self, lines: isize) {
+        let max = self.scrollback.len() as isize;
+        let next = self.view_offset as isize + lines;
+        self.view_offset = next.clamp(0, max) as usize;
     }
 
     /// Row id for viewport row `y`, stable as the line scrolls into history.

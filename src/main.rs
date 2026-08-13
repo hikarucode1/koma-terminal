@@ -467,17 +467,31 @@ impl App {
     /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
     /// back through history.
     ///
-    /// A no-op on the alternate screen: a full-screen application owns the
-    /// whole viewport and we keep no scrollback for it, so there is nothing to
-    /// move. Wheel input gets special treatment — see `wheel_scroll`.
+    /// Not a no-op on the alternate screen, whatever it looks like. `view_row`
+    /// does not ask which screen is showing, so this covers a running
+    /// full-screen program with older history.
+    ///
+    /// Which history, exactly: the lines that had already scrolled off *before*
+    /// the program started. The screenful it replaced is not among them — that
+    /// went into the saved buffer, which nothing can scroll to. Measured, not
+    /// assumed: a 3-row pane holding `SCREEN-A/B/C` over a history of
+    /// `old1/old2` shows `old2` and `old1` on the way back, never `SCREEN-C`.
+    ///
+    /// It comes back by scrolling the other way, by typing or pasting, by a
+    /// resize, or when the program leaves the alternate screen. Not on its own:
+    /// `scroll_up` adds to `view_offset` rather than clearing it, to keep a
+    /// scrolled-back view on the lines it is showing.
+    ///
+    /// The keyboard's scrollback keys come through here and do all of this on
+    /// the alternate screen, deliberately. The *wheel* does not, unless Shift
+    /// is held — see `wheel_action`, which is a different question from this
+    /// one and answers it for itself.
     fn scroll_pane(&mut self, id: PaneId, lines: isize) {
         let Some(p) = self.panes.get_mut(&id) else { return };
         if lines == 0 {
             return;
         }
-        let max = p.grid.scrollback.len() as isize;
-        let next = p.grid.view_offset as isize + lines;
-        p.grid.view_offset = next.clamp(0, max) as usize;
+        p.grid.scroll_view(lines);
     }
 
     /// Scrolling from the wheel or trackpad. On the alternate screen this turns
@@ -487,25 +501,23 @@ impl App {
     /// here too would make `Shift+PageUp` move an application's *cursor*
     /// instead of its view, and a page's worth of arrows is not a page anyway.
     ///
-    /// Unconditional only because no mouse reporting exists yet (no DECSET
-    /// 1000/1002/1003/1006 in grid.rs). When that lands, an application with
-    /// tracking enabled must receive mouse sequences instead, and xterm
-    /// additionally gates the arrow-key fallback on DECSET 1007.
+    /// Reached only when no mouse report went out — which does not mean none
+    /// was wanted. `wheel_action` has the table.
+    ///
+    /// `id` is the pane under the pointer, or the focused one when the pointer
+    /// is over the padding or the gap between panes and belongs to no pane at
+    /// all. That targeting is older than this routing and unchanged by it.
     fn wheel_scroll(&mut self, id: PaneId, lines: isize, shift: bool) {
         if lines == 0 {
             return;
         }
-        // 1007 off means the program has said not to synthesise arrows, which
-        // is what tmux does once it handles the mouse itself.
-        let arrows_allowed =
-            self.panes.get(&id).is_some_and(|p| p.grid.alt_active && p.grid.alternate_scroll);
-        if wheel_action(shift, arrows_allowed) == WheelAction::Viewport {
-            self.scroll_pane(id, lines);
-            return;
-        }
         let Some(p) = self.panes.get_mut(&id) else { return };
-        let bytes = alternate_scroll_bytes(lines, p.grid.app_cursor_keys);
-        p.pty.write(&bytes);
+        let holds_mouse = p.grid.mouse_tracking != mouse::Tracking::Off;
+        let action = wheel_action(shift, holds_mouse, p.grid.alt_active, p.grid.alternate_scroll);
+        let bytes = apply_wheel(action, &mut p.grid, lines);
+        if !bytes.is_empty() {
+            p.pty.write(&bytes);
+        }
     }
 
     fn scroll_focused(&mut self, lines: isize) {
@@ -1221,17 +1233,65 @@ enum WheelAction {
     Viewport,
     /// Hand it to the program as arrow keys (xterm's alternate scroll).
     Application,
+    /// Nowhere. Everything else would be worse than leaving it alone.
+    Nothing,
 }
 
-/// Shift is the standard escape hatch: it always drives our viewport and never
-/// the program. Without it, scrolling inside tmux — or at any shell prompt on
-/// the alternate screen — replays arrow keys into the command line instead of
-/// scrolling, which is what the arrows mean to a line editor.
+/// Where a wheel tick goes when no mouse report was sent.
 ///
-/// `arrows_allowed` is the alternate screen *and* DECSET 1007 still set: a
-/// program that handles the mouse itself turns 1007 off to decline them.
-fn wheel_action(shift: bool, arrows_allowed: bool) -> WheelAction {
-    if shift || !arrows_allowed { WheelAction::Viewport } else { WheelAction::Application }
+/// Written as the whole table rather than a condition at a time, because every
+/// previous attempt at this got one cell wrong and left a wheel dead or a
+/// program fed input it never asked for:
+///
+/// | Shift | screen | program holds mouse | 1007 | goes to     |
+/// |-------|--------|---------------------|------|-------------|
+/// | yes   | any    | any                 | any  | our view    |
+/// | no    | main   | any                 | any  | our view    |
+/// | no    | alt    | yes                 | any  | nowhere     |
+/// | no    | alt    | no                  | on   | arrow keys  |
+/// | no    | alt    | no                  | off  | nowhere     |
+///
+/// **Shift** is the escape hatch every terminal has, and the only way to reach
+/// our scrollback while a program owns the pointer.
+///
+/// **The main screen** has no program's display to protect and no arrows worth
+/// synthesising, so the gesture is ours whatever else is true.
+///
+/// **A program holding the mouse** gets nothing. Reaching here means no report
+/// went out, and the reasons are all forms of "we could not say where the
+/// pointer was" — over the window's padding, over the gap between panes, or
+/// past what the legacy encoding can address. Arrow keys would be input it
+/// never asked for: cursor movement inside a full-screen application, or, once
+/// through tmux, command history at the shell underneath. Our own viewport is
+/// no better, because moving it on the alternate screen covers the running
+/// program with older history — see `scroll_pane`.
+///
+/// **Otherwise** it is plain alternate scroll, the case xterm invented it for,
+/// down to a program that declines it with `1007l` getting nothing rather than
+/// a viewport it did not ask us to move.
+fn wheel_action(shift: bool, holds_mouse: bool, alt: bool, alternate_scroll: bool) -> WheelAction {
+    if shift || !alt {
+        return WheelAction::Viewport;
+    }
+    if holds_mouse {
+        return WheelAction::Nothing;
+    }
+    if alternate_scroll { WheelAction::Application } else { WheelAction::Nothing }
+}
+
+/// Carries out what `wheel_action` decided, returning whatever the program
+/// should be sent. Separate from `wheel_scroll` so it can be tested without a
+/// window: doing nothing is a behaviour here, and sending the tick to the
+/// viewport instead only looks like doing nothing.
+fn apply_wheel(action: WheelAction, g: &mut grid::Grid, lines: isize) -> Vec<u8> {
+    match action {
+        WheelAction::Nothing => Vec::new(),
+        WheelAction::Viewport => {
+            g.scroll_view(lines);
+            Vec::new()
+        }
+        WheelAction::Application => alternate_scroll_bytes(lines, g.app_cursor_keys),
+    }
 }
 
 /// Arrow keys an application should see for `lines` of wheel scrolling on the
@@ -2030,24 +2090,82 @@ mod tests {
         assert!(row <= rows, "anchor row {row} should be at most {rows}");
     }
 
+    /// Every combination of the four inputs, spelled out.
+    ///
+    /// Four attempts at this routing were reverted, each because a cell nobody
+    /// had written down turned out to be wrong. Enumerating them costs sixteen
+    /// lines and makes "which case did we not think about" a question the test
+    /// answers rather than the next review.
     #[test]
-    fn the_wheel_scrolls_our_viewport_on_the_main_screen() {
-        assert_eq!(wheel_action(false, false), WheelAction::Viewport);
-        assert_eq!(wheel_action(true, false), WheelAction::Viewport);
+    fn the_whole_wheel_table() {
+        use WheelAction::{Application, Nothing, Viewport};
+        // shift, holds_mouse, alt, alternate_scroll  ->  where the tick goes
+        let table = [
+            // Shift is the escape hatch and wins over everything.
+            (true, false, false, false, Viewport),
+            (true, false, false, true, Viewport),
+            (true, false, true, false, Viewport),
+            (true, false, true, true, Viewport),
+            (true, true, false, false, Viewport),
+            (true, true, false, true, Viewport),
+            (true, true, true, false, Viewport),
+            (true, true, true, true, Viewport),
+            // The main screen is ours: no program's display to cover, and no
+            // arrows worth synthesising.
+            (false, false, false, false, Viewport),
+            (false, false, false, true, Viewport),
+            (false, true, false, false, Viewport),
+            (false, true, false, true, Viewport),
+            // A program holding the mouse gets nothing: we could not say where
+            // the pointer was, arrows are input it never asked for, and moving
+            // our viewport would cover it.
+            (false, true, true, false, Nothing),
+            (false, true, true, true, Nothing),
+            // Plain alternate scroll, and a program that declines it.
+            (false, false, true, true, Application),
+            (false, false, true, false, Nothing),
+        ];
+        for (shift, holds, alt, scroll, want) in table {
+            assert_eq!(
+                wheel_action(shift, holds, alt, scroll),
+                want,
+                "shift={shift} holds_mouse={holds} alt={alt} 1007={scroll}"
+            );
+        }
     }
 
     #[test]
-    fn the_wheel_reaches_the_application_on_the_alternate_screen() {
-        // less and man have no scrollback of ours, so the wheel drives them.
-        assert_eq!(wheel_action(false, true), WheelAction::Application);
+    fn a_program_holding_the_mouse_is_never_sent_arrows() {
+        // The reported bug, named. With `set -g mouse on`, the pointer in the
+        // 2px gap between panes or the window's padding names no cell, so no
+        // report goes out. Arrow keys then went through tmux to the shell's
+        // line editor and read as command history.
+        assert_eq!(wheel_action(false, true, true, true), WheelAction::Nothing);
     }
 
     #[test]
-    fn shift_takes_the_wheel_back_from_the_application() {
-        // Reported from real use: inside tmux the arrow keys alternate scroll
-        // sends land in the command line instead of scrolling. Shift is the
-        // escape hatch, and it must win on the alternate screen too.
-        assert_eq!(wheel_action(true, true), WheelAction::Viewport);
+    fn a_pager_keeps_its_wheel_everywhere_in_the_window() {
+        // less and man say nothing about the mouse. A tick over the padding
+        // cannot be reported either, but arrows carry no position, so there is
+        // nothing to be wrong about and they still scroll.
+        assert_eq!(wheel_action(false, false, true, true), WheelAction::Application);
+    }
+
+    #[test]
+    fn the_wheel_never_moves_the_viewport_under_a_program_unshifted() {
+        // Moving it there covers the program with older history that neither
+        // its redraws nor ours take back. Shift is the deliberate way in, and
+        // must work in both directions so what it does it can undo.
+        for holds in [false, true] {
+            for scroll in [false, true] {
+                assert_ne!(
+                    wheel_action(false, holds, true, scroll),
+                    WheelAction::Viewport,
+                    "holds_mouse={holds} 1007={scroll}"
+                );
+                assert_eq!(wheel_action(true, holds, true, scroll), WheelAction::Viewport);
+            }
+        }
     }
 
     const END: &str = "\x1b[201~";
@@ -2194,5 +2312,59 @@ mod tests {
         // A trackpad rarely reports a clean zero on the other axis.
         assert_eq!(wheel_lines(6.0, 0.4, true), 6.0);
         assert_eq!(wheel_lines(0.4, 6.0, true), 6.0);
+    }
+
+    /// An alt-screen grid with history behind it: a program started at a prompt
+    /// that had already scrolled.
+    fn alt_grid_with_history() -> grid::Grid {
+        let mut g = grid::Grid::new(20, 3);
+        let mut parser = vte::Parser::new();
+        let mut run = |g: &mut grid::Grid, b: &[u8]| {
+            let mut perf = grid::Performer { grid: g, reply: Vec::new() };
+            parser.advance(&mut perf, b);
+        };
+        run(&mut g, b"one\r\ntwo\r\nthree\r\n$ ");
+        run(&mut g, b"\x1b[?1049h");
+        run(&mut g, b"FULL-SCREEN PROGRAM");
+        assert!(g.alt_active && !g.scrollback.is_empty());
+        g
+    }
+
+    /// What each decision actually does, which the table above cannot say.
+    ///
+    /// Two of the reverted attempts decided correctly and wired it wrongly:
+    /// "nothing" was implemented as a fall-through to the viewport, which on
+    /// the alternate screen is not nothing at all.
+    #[test]
+    fn each_wheel_action_does_what_it_says() {
+        let mut g = alt_grid_with_history();
+        assert!(apply_wheel(WheelAction::Nothing, &mut g, 1).is_empty());
+        assert_eq!(g.view_offset, 0, "nothing must not move the viewport either");
+
+        let mut g = alt_grid_with_history();
+        assert!(apply_wheel(WheelAction::Viewport, &mut g, 1).is_empty());
+        assert_eq!(g.view_offset, 1);
+        apply_wheel(WheelAction::Viewport, &mut g, -1);
+        assert_eq!(g.view_offset, 0, "and it has to come back the other way");
+
+        let mut g = alt_grid_with_history();
+        assert_eq!(apply_wheel(WheelAction::Application, &mut g, 2), b"\x1b[A\x1b[A".to_vec());
+        assert_eq!(g.view_offset, 0, "the program scrolls itself; our view stays put");
+    }
+
+    /// The reported bug end to end, one decision away from the pty.
+    #[test]
+    fn a_wheel_tick_over_the_gap_writes_nothing_into_tmux() {
+        // tmux with `set -g mouse on`, and a pointer the reporting path could
+        // not place. Nothing may reach the program and nothing may move.
+        let mut g = alt_grid_with_history();
+        let mut parser = vte::Parser::new();
+        let mut perf = grid::Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\x1b[?1002h\x1b[?1006h");
+        assert_ne!(g.mouse_tracking, mouse::Tracking::Off);
+
+        let action = wheel_action(false, true, g.alt_active, g.alternate_scroll);
+        assert_eq!(apply_wheel(action, &mut g, 3), Vec::<u8>::new());
+        assert_eq!(g.view_offset, 0);
     }
 }
