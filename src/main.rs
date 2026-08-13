@@ -55,6 +55,9 @@ struct PaneState {
     parser: vte::Parser,
     rect: Rect,
     exited: bool,
+    /// The process group last seen reading this pty. Compared against the
+    /// shell's own to notice a job ending — see `job_handed_back`.
+    last_foreground: Option<i32>,
 }
 
 impl PaneState {
@@ -66,6 +69,22 @@ impl PaneState {
             parser: vte::Parser::new(),
             rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             exited: false,
+            last_foreground: None,
+        })
+    }
+
+    /// As `new`, but with the shell named, so a test is not at the mercy of
+    /// whatever `$SHELL` happens to be.
+    #[cfg(test)]
+    fn with_shell(shell: &str, cols: usize, rows: usize) -> Result<Self> {
+        let pty = Pty::spawn_with_shell(shell, cols as u16, rows as u16, || {})?;
+        Ok(PaneState {
+            pty,
+            grid: Grid::new(cols, rows),
+            parser: vte::Parser::new(),
+            rect: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            exited: false,
+            last_foreground: None,
         })
     }
 
@@ -76,11 +95,34 @@ impl PaneState {
         if bytes.is_empty() {
             return (false, Vec::new());
         }
+        // Before the bytes are parsed, so that a program setting its modes on
+        // the way in cannot have them cleared by the same pump. A job ending
+        // always brings output with it — the shell's next prompt — so this
+        // costs nothing while a pane is idle.
+        let foreground = self.pty.foreground_group();
+        if job_handed_back(self.last_foreground, foreground, self.pty.shell_pid()) {
+            self.grid.reset_program_modes();
+        }
+        self.last_foreground = foreground;
         let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };
         self.parser.advance(&mut perf, &bytes);
         let reply = std::mem::take(&mut perf.reply);
         (true, reply)
     }
+}
+
+/// Whether the terminal has just been handed back to the shell.
+///
+/// `tcgetpgrp` says which process group is reading the pty. While a job runs it
+/// is that job's; when the job ends it is the shell's again — and that is true
+/// however it ended, including the SIGKILL that gave it no chance to put the
+/// modes it set back.
+///
+/// Only this direction counts. A job *starting* changes the group too, and
+/// resetting then would clear the modes the new program is in the middle of
+/// setting: the group changes at fork, before the program has written a byte.
+fn job_handed_back(prev: Option<i32>, now: Option<i32>, shell: Option<i32>) -> bool {
+    now.is_some() && now == shell && prev != now
 }
 
 struct App {
@@ -2194,5 +2236,141 @@ mod tests {
         // A trackpad rarely reports a clean zero on the other axis.
         assert_eq!(wheel_lines(6.0, 0.4, true), 6.0);
         assert_eq!(wheel_lines(0.4, 6.0, true), 6.0);
+    }
+
+    #[test]
+    fn a_job_ending_is_the_shell_getting_the_terminal_back() {
+        let shell = Some(100);
+        // A job runs, then ends: the group returns to the shell's own.
+        assert!(job_handed_back(Some(200), Some(100), shell));
+        // A job starting is the same change seen from the other side, and must
+        // not count: the group changes at fork, before the program has written
+        // the modes it is about to set, so resetting here would clear them.
+        assert!(!job_handed_back(Some(100), Some(200), shell));
+        // Sitting at the prompt is not an event.
+        assert!(!job_handed_back(Some(100), Some(100), shell));
+        // One job replacing another never passes through the shell.
+        assert!(!job_handed_back(Some(200), Some(300), shell));
+        // Nothing to compare against, or nothing to read: no claim either way.
+        assert!(!job_handed_back(Some(200), None, shell));
+        assert!(!job_handed_back(Some(200), Some(100), None));
+    }
+
+    #[test]
+    fn the_modes_a_program_leaves_behind_are_the_ones_put_back() {
+        // What a killed vim or a dropped ssh leaves set. Mouse reports would
+        // otherwise keep landing at the shell prompt as `[<0;12;5M` junk, and
+        // 1007 would keep the next pager from getting its arrow keys.
+        let mut g = grid::Grid::new(20, 5);
+        let mut parser = vte::Parser::new();
+        let mut perf = grid::Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\x1b[?1002h\x1b[?1006h\x1b[?1007l\x1b[?2004h\x1b[?1h");
+        assert_ne!(g.mouse_tracking, mouse::Tracking::Off);
+        assert!(!g.alternate_scroll);
+
+        g.reset_program_modes();
+        assert_eq!(g.mouse_tracking, mouse::Tracking::Off);
+        assert_eq!(g.mouse_encoding, mouse::Encoding::Legacy);
+        assert!(g.alternate_scroll);
+        // Not the shell's own. It set these at its prompt and is still running.
+        assert!(g.bracketed_paste, "bracketed paste belongs to the shell");
+        assert!(g.app_cursor_keys, "so do application cursor keys");
+    }
+
+    /// End to end, against a real shell: a program takes the mouse, is killed
+    /// outright, and the pane is left usable.
+    ///
+    /// The decision and the mode list are unit-tested above; this is the wiring
+    /// between them, which is the part that has no other way to be wrong out
+    /// loud. Removing the `reset_program_modes` call from `pump` leaves every
+    /// other test in this file green.
+    #[test]
+    fn a_killed_program_stops_reporting_the_mouse_at_the_prompt() {
+        use std::time::{Duration, Instant};
+        let mut pane = PaneState::with_shell("/bin/sh", 80, 24).unwrap();
+        let deadline = || Instant::now() + Duration::from_secs(15);
+
+        // Pump until `done` says so, or give up.
+        let mut settle = |pane: &mut PaneState, done: &dyn Fn(&PaneState) -> bool| {
+            let end = deadline();
+            while Instant::now() < end {
+                pane.pump();
+                if done(pane) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+
+        // A program that claims the mouse, waits for a line, then kills itself
+        // with no chance to put anything back — the end a crash comes to.
+        //
+        // It dies on its own rather than being signalled from here. A test that
+        // sends a signal to a process group it derived from the code under test
+        // will, the one time that code is wrong, send it to the test runner's
+        // own group instead — which is what happened while this was written.
+        pane.pty.write(b"sh -c 'printf \"\\033[?1002h\\033[?1006h\"; read x; kill -9 $$'\n");
+        assert!(
+            settle(&mut pane, &|p| p.grid.mouse_tracking != mouse::Tracking::Off),
+            "the program never took the mouse"
+        );
+        assert_eq!(pane.grid.mouse_encoding, mouse::Encoding::Sgr);
+        assert_ne!(
+            pane.pty.foreground_group(),
+            pane.pty.shell_pid(),
+            "the job never took the terminal"
+        );
+
+        // Let it go.
+        pane.pty.write(b"\n");
+
+        assert!(
+            settle(&mut pane, &|p| p.grid.mouse_tracking == mouse::Tracking::Off),
+            "the pane kept reporting the mouse after the program died"
+        );
+        assert_eq!(pane.grid.mouse_encoding, mouse::Encoding::Legacy);
+        assert!(pane.grid.alternate_scroll, "and the next pager gets its arrow keys back");
+    }
+
+    /// The reset is an edge, not a level: it fires when a job hands the
+    /// terminal back, not for as long as the shell holds it.
+    ///
+    /// `printf` is a builtin, so this runs without a job ever being forked and
+    /// the foreground group never leaves the shell. Treating "the shell is in
+    /// front" as the condition rather than "the shell has just come back to the
+    /// front" would undo the mode on the very next pump.
+    #[test]
+    fn a_mode_set_at_the_prompt_is_left_alone() {
+        use std::time::{Duration, Instant};
+        let mut pane = PaneState::with_shell("/bin/sh", 80, 24).unwrap();
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end && pane.pty.foreground_group() != pane.pty.shell_pid() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(pane.pty.foreground_group(), pane.pty.shell_pid(), "never reached a prompt");
+
+        pane.pty.write(b"printf '\\033[?1002h'\n");
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end {
+            pane.pump();
+            if pane.grid.mouse_tracking != mouse::Tracking::Off {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_ne!(pane.grid.mouse_tracking, mouse::Tracking::Off, "the mode was never set");
+
+        // Several more pumps at the same prompt must not take it away again.
+        for _ in 0..5 {
+            pane.pty.write(b"printf hello\n");
+            std::thread::sleep(Duration::from_millis(80));
+            pane.pump();
+        }
+        assert_ne!(
+            pane.grid.mouse_tracking,
+            mouse::Tracking::Off,
+            "a mode set at the prompt was reset by the shell merely being in front"
+        );
     }
 }

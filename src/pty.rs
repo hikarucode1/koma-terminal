@@ -144,6 +144,23 @@ impl Pty {
     }
 
     /// True once the shell has exited *and* its output has been fully consumed.
+    /// The process group currently reading the terminal, and the shell's own.
+    ///
+    /// This is `tcgetpgrp` on the master side: while a job runs in the
+    /// foreground the two differ, and when it ends — however it ends, including
+    /// a signal that left it no chance to tidy up — they become equal again.
+    /// It is the one account of "a program finished" that does not depend on
+    /// the program saying so.
+    pub fn foreground_group(&self) -> Option<i32> {
+        self.master.process_group_leader().map(|p| p as i32)
+    }
+
+    /// The shell we spawned. Its pid is its process group while it sits at a
+    /// prompt, which is what `foreground_group` returns then.
+    pub fn shell_pid(&self) -> Option<i32> {
+        self.child.process_id().map(|p| p as i32)
+    }
+
     pub fn is_dead(&mut self) -> bool {
         if self.dead.load(Ordering::Acquire) {
             return true;
@@ -310,5 +327,47 @@ mod tests {
         let shell = resolve_shell(None);
         let out = run_in(&shell, "echo KOMA-OK\n", Duration::from_secs(20));
         assert!(out.contains("KOMA-OK"), "{shell:?} produced: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The signal the mode reset is built on, against a real shell.
+    ///
+    /// The job kills *itself* on command rather than being killed from here.
+    /// A test that sends a signal to a process group it derived from the code
+    /// under test will, the one time that code is wrong, send it to the test
+    /// runner's own group instead — which is exactly what happened while this
+    /// was being written.
+    #[test]
+    fn a_job_that_dies_hands_the_terminal_back_to_the_shell() {
+        let mut pty = Pty::spawn_with_shell("/bin/sh", 80, 24, || {}).unwrap();
+        let shell = pty.shell_pid();
+        assert!(shell.is_some(), "no pid for the shell we spawned");
+
+        let settle = |pty: &Pty, at_prompt: bool| {
+            let end = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < end {
+                if (pty.foreground_group() == shell) == at_prompt {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+
+        assert!(settle(&pty, true), "the shell never reached its prompt");
+
+        // A job that waits for a line, then kills itself with no chance to tidy
+        // up — the same end a crash comes to.
+        pty.write(b"sh -c 'read x; kill -9 $$'\n");
+        assert!(settle(&pty, false), "the job never took the terminal");
+        assert_ne!(pty.foreground_group(), shell);
+
+        pty.write(b"\n");
+        assert!(settle(&pty, true), "the terminal never came back to the shell");
     }
 }

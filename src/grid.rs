@@ -541,6 +541,19 @@ impl Grid {
         }
     }
 
+    /// Puts back the modes that belong to a program rather than to the
+    /// session, for when one ended without saying so.
+    ///
+    /// Only these three. Bracketed paste and application cursor keys are the
+    /// shell's — it sets them at its prompt, and clearing them here would break
+    /// the very thing that is running. The alternate screen is left alone too:
+    /// switching back would throw away whatever has been printed on it since.
+    pub fn reset_program_modes(&mut self) {
+        self.mouse_tracking = MouseTracking::Off;
+        self.mouse_encoding = MouseEncoding::Legacy;
+        self.alternate_scroll = true;
+    }
+
     fn set_alt_screen(&mut self, on: bool) {
         if on == self.alt_active {
             return;

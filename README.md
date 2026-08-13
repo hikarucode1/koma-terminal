@@ -143,7 +143,7 @@ the box glyph's, not that of the letter standing in for it on the wire.
 cargo test
 ```
 
-206 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
+211 tests cover the VT parser and grid (wrapping, scroll regions, scrollback
 anchoring, stable row ids across trimming, resize moving rows to and from
 history and carrying the alternate screen's saved buffer with it, SGR including
 truecolor, alt screen, wide characters, DEC line drawing and the charset a saved
@@ -163,7 +163,8 @@ legacy column ceiling), IME composition layout (wrapping, kana taking two
 columns, active-segment byte ranges, caret tracking, and which pane a
 composition commits into), font rasterisation and the atlas, and real pty
 behaviour (a shell's output round-tripping, `stty size` seeing the right
-dimensions, EOF on exit).
+dimensions, EOF on exit, and a job that dies without tidying up handing the
+terminal back to the shell).
 
 The GPU path itself is not covered by tests — it needs a display.
 
