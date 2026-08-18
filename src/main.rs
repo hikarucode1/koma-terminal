@@ -467,27 +467,16 @@ impl App {
     /// Scrolls a pane's viewport through its scrollback. Positive `lines` moves
     /// back through history.
     ///
-    /// **Not** a no-op on the alternate screen. Scrollback survives the switch —
-    /// `grid.rs` only stops *pushing* to it while `alt_active` — so this walks
-    /// up into whatever the shell printed before the program started, drawing
-    /// it over the program's own screen. That is the documented behaviour of
-    /// Shift+wheel, but it means an unwanted call here is visible damage: the
-    /// cursor disappears (`show_cursor` wants `view_offset == 0`) and the
-    /// program's own repaints will not undo it, because the `scroll_up` branch
-    /// that resets `view_offset` is closed while `alt_active`. Within the
-    /// program's lifetime only a call that brings `view_offset` back to 0
-    /// restores its screen; otherwise the damage lasts until `set_alt_screen`
-    /// zeroes the offset on the way out.
-    ///
-    /// Wheel input gets special treatment — see `wheel_scroll`.
+    /// Refuses to move away from the live screen while the alternate screen is
+    /// up — see `viewport_target` for why. Wheel input gets special treatment
+    /// on top of that: see `wheel_scroll`.
     fn scroll_pane(&mut self, id: PaneId, lines: isize) {
         let Some(p) = self.panes.get_mut(&id) else { return };
         if lines == 0 {
             return;
         }
-        let max = p.grid.scrollback.len() as isize;
-        let next = p.grid.view_offset as isize + lines;
-        p.grid.view_offset = next.clamp(0, max) as usize;
+        p.grid.view_offset =
+            viewport_target(p.grid.view_offset, lines, p.grid.scrollback.len(), p.grid.alt_active);
     }
 
     /// Scrolling from the wheel or trackpad. On the alternate screen this turns
@@ -523,8 +512,16 @@ impl App {
     }
 
     /// Jumps to the oldest retained line, or back to the live screen.
+    ///
+    /// Home is refused on the alternate screen for the same reason
+    /// `viewport_target` refuses the wheel there: the oldest retained line
+    /// predates the program entirely. End is always allowed — returning to the
+    /// live screen is the direction that repairs, never the one that damages.
     fn scroll_to_edge(&mut self, top: bool) {
         let Some(p) = self.panes.get_mut(&self.focus) else { return };
+        if top && p.grid.alt_active {
+            return;
+        }
         p.grid.view_offset = if top { p.grid.scrollback.len() } else { 0 };
     }
 
@@ -1235,10 +1232,35 @@ enum WheelAction {
     Ignore,
 }
 
+/// Where the viewport lands after scrolling `lines` (positive moves back
+/// through history) from `current`, for a pane holding `scrollback` lines.
+///
+/// **The alternate screen only allows movement back towards the live screen.**
+/// Scrollback survives the switch — `grid.rs` only stops *pushing* to it while
+/// `alt_active` — so walking up leads into whatever the shell printed before
+/// the program started, and draws it over the program's own screen. The
+/// cursor goes with it (`show_cursor` wants `view_offset == 0`) and the
+/// program's own repaints do not undo it, because the `scroll_up` branch that
+/// resets the offset is closed while `alt_active`. Nothing there is worth
+/// showing: inside tmux or vim it is the screen from before they started.
+///
+/// Movement towards 0 stays open on purpose, so an offset that got set some
+/// other way can always be undone rather than stranding the viewport.
+fn viewport_target(current: usize, lines: isize, scrollback: usize, alt_active: bool) -> usize {
+    if alt_active && lines > 0 {
+        return current;
+    }
+    (current as isize + lines).clamp(0, scrollback as isize) as usize
+}
+
 /// Shift is the standard escape hatch: it always drives our viewport and never
 /// the program. Without it, scrolling inside tmux — or at any shell prompt on
 /// the alternate screen — replays arrow keys into the command line instead of
 /// scrolling, which is what the arrows mean to a line editor.
+///
+/// `Viewport` is a decision about *who* handles the tick, not a promise that
+/// something moves: on the alternate screen `viewport_target` holds the offset
+/// where it is, so Shift+wheel there is deliberately inert.
 ///
 /// Reached only once a mouse report has already failed to go out, and
 /// `tracking` is what tells the two reasons for that apart. Off means the
@@ -1246,9 +1268,9 @@ enum WheelAction {
 /// it did ask and we could not answer — the pointer resolved to no cell at all
 /// (window margin, the gap between panes) or legacy encoding ran out of room
 /// past column 223. Those ticks are dropped: synthesising arrows would type
-/// into a program that never wanted keys, and falling through to the viewport
-/// would paint pre-program scrollback over its screen (see `scroll_pane`).
-/// xterm drops them too.
+/// into a program that never wanted keys, and the viewport has nothing to show
+/// for the alternate screen anyway (see `viewport_target`). xterm drops them
+/// too.
 ///
 /// `arrows_allowed` is the alternate screen *and* DECSET 1007 still set: a
 /// program that handles the mouse itself turns 1007 off to decline them.
@@ -2076,9 +2098,41 @@ mod tests {
     fn shift_takes_the_wheel_back_from_the_application() {
         // Reported from real use: inside tmux the arrow keys alternate scroll
         // sends land in the command line instead of scrolling. Shift is the
-        // escape hatch, and it must win on the alternate screen too.
+        // escape hatch, and it must win on the alternate screen too — it keeps
+        // the tick away from the program. What the viewport then does with it
+        // is `viewport_target`'s call, and there it is a no-op.
         assert_eq!(wheel_action(true, NO_MOUSE, true), WheelAction::Viewport);
         assert_eq!(wheel_action(true, MouseTracking::ButtonEvent, true), WheelAction::Viewport);
+    }
+
+    #[test]
+    fn the_viewport_will_not_walk_into_history_the_program_covered() {
+        // Reported from real use: Shift+wheel inside tmux painted the screen
+        // from before tmux started over tmux, and took the cursor with it.
+        // Nothing under the alternate screen is worth showing, so nothing moves.
+        assert_eq!(viewport_target(0, 3, 500, true), 0);
+        assert_eq!(viewport_target(7, 1, 500, true), 7);
+        // Shift+PageUp is the same damage by another key, so it is the same
+        // answer: the rule lives here, below every scrollback entry point.
+        assert_eq!(viewport_target(0, 40, 500, true), 0);
+    }
+
+    #[test]
+    fn the_viewport_can_always_come_back_to_the_live_screen() {
+        // The direction that repairs stays open even on the alternate screen —
+        // an offset set some other way must never strand the viewport.
+        assert_eq!(viewport_target(5, -2, 500, true), 3);
+        assert_eq!(viewport_target(5, -99, 500, true), 0);
+    }
+
+    #[test]
+    fn the_main_screen_scrolls_both_ways_and_clamps() {
+        assert_eq!(viewport_target(0, 3, 500, false), 3);
+        assert_eq!(viewport_target(3, -1, 500, false), 2);
+        // Neither end runs past what is retained.
+        assert_eq!(viewport_target(499, 5, 500, false), 500);
+        assert_eq!(viewport_target(2, -9, 500, false), 0);
+        assert_eq!(viewport_target(0, 1, 0, false), 0, "no scrollback, nowhere to go");
     }
 
     #[test]
