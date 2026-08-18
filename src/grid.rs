@@ -1015,6 +1015,12 @@ mod tests {
         // claim this was a no-op on the alternate screen and that no scrollback
         // was kept; a wheel fix was then reasoned out from that and broke. Both
         // halves are false, so pin them down.
+        //
+        // Note this is what the *grid* will do, not what koma does: the App
+        // layer now refuses to move `view_offset` away from 0 while the
+        // alternate screen is up (`viewport_target`). The capability stays
+        // here so that rule keeps being a policy someone chose, visible in one
+        // place, rather than an accident of the data structure.
         let mut g = feed(20, 2, &["one\r\ntwo\r\nthree\r\n", "\x1b[?1049h", "FULLSCREEN"]);
         assert!(g.alt_active);
         assert_eq!(g.scrollback.len(), 2, "scrollback survives the switch");
