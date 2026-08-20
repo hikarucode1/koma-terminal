@@ -77,7 +77,6 @@ impl PaneState {
             return (false, Vec::new());
         }
         let mut reply = Vec::new();
-        let mut had_bytes = false;
         for event in events {
             match event {
                 // Where the reader thread put it, which is where in the stream
@@ -90,14 +89,16 @@ impl PaneState {
                     }
                 }
                 FromPty::Bytes(bytes) => {
-                    had_bytes = true;
                     let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };
                     self.parser.advance(&mut perf, &bytes);
-                    reply.extend_from_slice(&perf.reply);
+                    reply.append(&mut perf.reply);
                 }
             }
         }
-        (had_bytes, reply)
+        // True, not "were there any bytes": a reset is a change to the grid
+        // whether or not anything arrived with it, and the handover travels as
+        // its own send, so a pump can land on it alone.
+        (true, reply)
     }
 }
 

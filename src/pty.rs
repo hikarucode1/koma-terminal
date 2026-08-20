@@ -154,7 +154,10 @@ impl ForegroundWatch {
         // branch above records it afresh.
         match self.last_program_pgid.take() {
             Some(pgid) => !still_alive(pgid),
-            // Never saw who had it — the handover is all we know, so report it.
+            // Unreachable in practice, and deliberately not written as such:
+            // what rules it out is that `shell_in_front` starts true, so the
+            // branch above has always run first and always left a pgid here.
+            // A handover that cannot be attributed is still a handover.
             None => true,
         }
     }
@@ -237,9 +240,15 @@ impl Pty {
         // A copy of our own, so the reader thread never races the master's
         // lifetime — an fd number closed on one thread can be handed straight
         // back out to something else on another.
+        //
+        // `F_DUPFD_CLOEXEC`, not `dup`: plain `dup` drops the flag, and every
+        // other copy of these fds in the tree keeps it. Nothing leaks today
+        // either way, because the spawn path closes everything above stderr
+        // before exec — but that is somebody else's implementation detail to
+        // rely on, and this costs nothing.
         #[cfg(unix)]
         let watch_fd = pair.master.as_raw_fd().and_then(|fd| {
-            let dup = unsafe { libc::dup(fd) };
+            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             (dup >= 0).then_some(dup)
         });
         #[cfg(not(unix))]
@@ -265,7 +274,10 @@ impl Pty {
                         #[cfg(unix)]
                         let front = watch_fd.and_then(foreground_pgid_of);
                         #[cfg(not(unix))]
-                        let front = None;
+                        let front = {
+                            let _ = watch_fd;
+                            None
+                        };
                         if watch.sample(front, job_leader_alive)
                             && tx.send(FromPty::Handover).is_err()
                         {
@@ -298,6 +310,7 @@ impl Pty {
     }
 
     #[cfg(not(unix))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn foreground_pgid(&self) -> Option<i32> {
         None
     }
@@ -582,7 +595,7 @@ mod tests {
         pty.kill();
         let before = before.expect("the handover was lost to the stall");
         assert!(
-            before.windows(8).any(|w| w == b"\x1b[?1002h"[..8].as_ref()),
+            before.windows(8).any(|w| w == b"\x1b[?1002h"),
             "the program's own bytes belong before the handover, not after"
         );
         assert!(!after.is_empty(), "the shell's prompt belongs after it");
