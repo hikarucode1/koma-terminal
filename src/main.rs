@@ -33,7 +33,7 @@ use grid::{
 };
 use mouse::{Button as MouseBtn, Event as MouseEv, Mods as MouseMods, Tracking as MouseTracking};
 use pane::{Axis, Node, PaneId, Rect};
-use pty::Pty;
+use pty::{FromPty, Pty};
 use selection::{Mode as SelMode, Point, Selection};
 use theme::{Theme, to_linear};
 
@@ -72,24 +72,32 @@ impl PaneState {
     /// Feeds pty output through the VT parser, returning any reply the terminal
     /// owes the shell (cursor position reports and the like).
     fn pump(&mut self) -> (bool, Vec<u8>) {
-        let bytes = self.pty.read_available();
-        if bytes.is_empty() {
+        let events = self.pty.read_events();
+        if events.is_empty() {
             return (false, Vec::new());
         }
-        // Before the bytes, not after. Output arriving now is the shell's — its
-        // "Killed" line and a fresh prompt — and the prompt is where a shell
-        // re-arms the modes it owns. Clearing first lets those land on top;
-        // clearing afterwards would wipe them.
-        // The handover fires after every command, so it is only half the
-        // question; the other half is whether anything was left in a state to
-        // clean up. Short-circuit order matters: the handover has to be asked
-        // first either way, because asking is what consumes the edge.
-        if self.pty.foreground_returned_to_shell() && self.grid.a_program_left_state_behind() {
-            self.grid.soft_reset();
+        let mut reply = Vec::new();
+        for event in events {
+            match event {
+                // Where the reader thread put it, which is where in the stream
+                // it happened. The handover arrives after every command, so it
+                // is only half the question; the other half is whether
+                // anything was left in a state worth cleaning up.
+                FromPty::Handover => {
+                    if self.grid.a_program_left_state_behind() {
+                        self.grid.soft_reset();
+                    }
+                }
+                FromPty::Bytes(bytes) => {
+                    let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };
+                    self.parser.advance(&mut perf, &bytes);
+                    reply.append(&mut perf.reply);
+                }
+            }
         }
-        let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };
-        self.parser.advance(&mut perf, &bytes);
-        let reply = std::mem::take(&mut perf.reply);
+        // True, not "were there any bytes": a reset is a change to the grid
+        // whether or not anything arrived with it, and the handover travels as
+        // its own send, so a pump can land on it alone.
         (true, reply)
     }
 }
