@@ -271,10 +271,42 @@ impl Grid {
         self.bg = Color::Default;
         self.flags = 0;
         self.wrap_pending = false;
+        // The saved cursor goes too. It is not a mode a program re-establishes
+        // on the way in, it is a snapshot taken mid-run, and it carries the
+        // charset with it: leave it and a later bare `ESC 8` restores the dead
+        // program's line drawing, which is the very thing resetting `charsets`
+        // above is for. A real terminal's DECSTR resets it as well, and
+        // `restore_cursor` already treats "nothing saved" as nothing to do.
+        self.saved = None;
         // The alternate screen stays up, as decided above — but whoever raised
         // it is gone. Remembering that is what stops the wheel typing arrows
         // at the recovered prompt, and what lets the viewport move again.
         self.alt_orphaned = self.alt_active;
+    }
+
+    /// Whether anything is set that only a program sets — the question of
+    /// whether there is a mess to clean up at all.
+    ///
+    /// The handover this gates on is "the shell has the terminal back", which
+    /// is true after *every* command, not just after one that died badly.
+    /// Resetting on all of them would undo deliberate state: `tput civis` typed
+    /// at a prompt is a program that takes the terminal, sets a mode and exits,
+    /// and it would be undone by the very next prompt. So the trigger is
+    /// narrowed to states nobody arrives at on purpose from a shell prompt.
+    ///
+    /// Cursor visibility is deliberately not one of them — that is exactly the
+    /// `tput civis` case. Neither is `app_cursor_keys`: readline turns it on
+    /// and off around every prompt, and this is read *before* the bytes that
+    /// would turn it off are parsed, so it is regularly true for reasons that
+    /// have nothing to do with a program leaving. Both are still cleared once
+    /// something else here has triggered.
+    pub fn a_program_left_state_behind(&self) -> bool {
+        self.alt_active
+            || self.mouse_tracking != MouseTracking::Off
+            || self.top != 0
+            || self.bot != self.rows - 1
+            || self.charsets != [Charset::Ascii; 2]
+            || self.gl != 0
     }
 
     /// Whether a full-screen program is actually driving this pane's screen.
@@ -1737,6 +1769,43 @@ mod tests {
         // again, not the letter.
         let g = feed(10, 2, &["\x1b(0\x1b7\x1b(Bx\x1b8q"]);
         assert_eq!(row_text(&g, 0), "─", "the restore did not bring the charset back");
+    }
+
+    #[test]
+    fn a_reset_takes_the_saved_cursor_with_it() {
+        // The snapshot carries the charset, so leaving it behind lets a bare
+        // `ESC 8` from the shell put the dead program's line drawing back —
+        // undoing the charset reset from a direction it never looked.
+        let mut g = feed(10, 2, &["\x1b[?1049h\x1b(0\x1b7\x1b(B"]);
+        g.soft_reset();
+
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\x1b8q");
+        assert_eq!(row_text(&g, 0), "q", "the restore brought line drawing back");
+    }
+
+    #[test]
+    fn a_hidden_cursor_on_its_own_is_not_a_program_leaving_state() {
+        // `tput civis` at a prompt is a program that takes the terminal, sets
+        // a mode and exits. Treating that as a mess to clean up means undoing
+        // it at the very next prompt.
+        let g = feed(10, 2, &["\x1b[?25l"]);
+        assert!(!g.cursor_visible);
+        assert!(!g.a_program_left_state_behind());
+    }
+
+    #[test]
+    fn the_states_nobody_reaches_from_a_prompt_do_count() {
+        for seq in [
+            "\x1b[?1049h", // a full-screen program's screen
+            "\x1b[?1002h", // the mouse
+            "\x1b[2;5r",   // a scroll region
+            "\x1b(0",      // line drawing
+        ] {
+            let g = feed(10, 8, &[seq]);
+            assert!(g.a_program_left_state_behind(), "{seq:?} should count as left behind");
+        }
     }
 
     #[test]

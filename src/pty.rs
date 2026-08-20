@@ -65,6 +65,28 @@ pub struct Pty {
     /// nothing has run yet — so the first check cannot report a handover that
     /// never happened.
     shell_in_front: bool,
+    /// The group that held the terminal before the shell got it back, kept so
+    /// the handover can be asked the follow-up question: is it gone, or was it
+    /// only stopped?
+    last_program_pgid: Option<i32>,
+}
+
+/// Whether a process group still exists.
+///
+/// Signal 0 delivers nothing but runs every existence and permission check the
+/// kernel would run for a real signal, which is exactly the question. `EPERM`
+/// is a yes: the group is there, it is simply not ours to signal.
+#[cfg(unix)]
+fn process_group_alive(pgid: i32) -> bool {
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_group_alive(_pgid: i32) -> bool {
+    false
 }
 
 impl Pty {
@@ -136,6 +158,7 @@ impl Pty {
             rows,
             shell_pgid,
             shell_in_front: true,
+            last_program_pgid: None,
         })
     }
 
@@ -169,6 +192,14 @@ impl Pty {
     /// so. Callers use it to undo what the program left set — see
     /// `Grid::soft_reset`.
     ///
+    /// **Suspending is not finishing.** `Ctrl-Z` hands the terminal back just
+    /// as dying does, but the program is still there, holding everything it
+    /// set and expecting to find it on `fg`. So the handover asks one more
+    /// question — does the group that had the terminal still exist? — and
+    /// stays quiet when it does. A program stopped and then killed while
+    /// stopped is therefore never cleaned up: the shell already has the
+    /// terminal, so no second handover is coming.
+    ///
     /// Two ways this stays silent. Both leave the old behaviour in place
     /// rather than introducing a new failure, but neither is narrow:
     ///
@@ -190,7 +221,20 @@ impl Pty {
         let now_shell = front == shell;
         let returned = now_shell && !self.shell_in_front;
         self.shell_in_front = now_shell;
-        returned
+        if !now_shell {
+            self.last_program_pgid = Some(front);
+            return false;
+        }
+        if !returned {
+            return false;
+        }
+        // Taken either way: on `fg` the group takes the terminal again and the
+        // branch above records it afresh.
+        match self.last_program_pgid.take() {
+            Some(pgid) => !process_group_alive(pgid),
+            // Never saw who had it — the handover is all we know, so report it.
+            None => true,
+        }
     }
 
     /// Drains everything buffered without blocking.
@@ -337,6 +381,41 @@ mod tests {
             wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_returned_to_shell());
         pty.kill();
         assert!(handed_back, "the shell should get the terminal back from a killed job");
+    }
+
+    #[test]
+    fn a_suspended_program_has_not_finished() {
+        // Ctrl-Z hands the terminal back exactly as dying does, but vim is
+        // still sitting there holding its alternate screen and its mouse, and
+        // expects to find them on `fg`. Cleaning up here would hand it back a
+        // terminal it no longer recognises.
+        let mut pty = Pty::spawn(80, 24, || {}).expect("could not open a pty");
+        let shell = pty.shell_pgid().expect("the shell should have a pid");
+        assert!(
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_pgid() == Some(shell)),
+            "the shell never reached a prompt"
+        );
+
+        pty.write(b"sleep 30\n");
+        assert!(
+            wait_until(&mut pty, Duration::from_secs(20), |p| {
+                p.foreground_pgid().is_some_and(|f| f != shell)
+                    // Consumed here, which is also what records who had it.
+                    && !p.foreground_returned_to_shell()
+            }),
+            "the job never took the terminal"
+        );
+
+        pty.write(b"\x1a"); // Ctrl-Z: the line discipline sends SIGTSTP.
+        let back =
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_pgid() == Some(shell));
+        let reported = pty.foreground_returned_to_shell();
+        pty.write(b"kill -9 %1\n");
+        let _ = wait_until(&mut pty, Duration::from_secs(5), |_| false);
+        pty.kill();
+
+        assert!(back, "the shell should hold the terminal while the job is stopped");
+        assert!(!reported, "a stopped job is not a finished one");
     }
 
     #[test]
