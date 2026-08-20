@@ -1772,6 +1772,81 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Pumps a real pane until `done` holds, or the time runs out. Mirrors how
+    /// the event loop drives `pump`: only when bytes have actually arrived.
+    fn pump_until(
+        pane: &mut PaneState,
+        limit: Duration,
+        done: impl Fn(&PaneState) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            pane.pump();
+            if done(pane) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// What `wheel_scroll` asks of a pane before it decides. Kept next to the
+    /// test that needs it because the pane there is real, not a fixture.
+    fn arrows_allowed(pane: &PaneState) -> bool {
+        pane.grid.program_owns_screen() && pane.grid.alternate_scroll
+    }
+
+    #[test]
+    fn the_wheel_does_not_type_arrows_at_the_prompt_a_killed_program_left() {
+        // Driven by a real shell and a real SIGKILL, because the whole point is
+        // that nothing on the wire marks the end: the program is gone before it
+        // can send `1049l` or `1002l`, and only the kernel knows.
+        let mut pane = PaneState::new(80, 24, || {}).expect("could not open a pty");
+        let shell = pane.pty.shell_pgid().expect("the shell should have a pid");
+        assert!(
+            pump_until(&mut pane, Duration::from_secs(20), |p| p.pty.foreground_pgid()
+                == Some(shell)),
+            "the shell never reached a prompt"
+        );
+
+        // A full-screen program that takes the mouse, the way tmux does.
+        pane.pty.write(
+            b"sh -c 'printf \"\\033[?1049h\\033[?1002h\\033[?1006h\"; sleep 1; kill -9 $$'\n",
+        );
+        assert!(
+            pump_until(&mut pane, Duration::from_secs(20), |p| p.grid.program_owns_screen()
+                && p.grid.mouse_tracking != mouse::Tracking::Off),
+            "the program never got the alternate screen and the mouse"
+        );
+        // While it is alive the wheel is its business, which is what `less`
+        // and `man` depend on.
+        assert!(arrows_allowed(&pane), "a live program still gets alternate scroll");
+
+        // Now it is killed. The shell takes the terminal back and prints over
+        // whatever was on screen.
+        assert!(
+            pump_until(&mut pane, Duration::from_secs(20), |p| !p.grid.program_owns_screen()),
+            "the pane never noticed the program had gone"
+        );
+        pane.pty.kill();
+
+        assert!(pane.grid.alt_active, "the last frame the program drew stays up");
+        assert_eq!(pane.grid.mouse_tracking, mouse::Tracking::Off, "the mouse is ours again");
+
+        // The bug this is here for: with the screen still flagged as the
+        // alternate one, the wheel used to be handed to the shell as arrow
+        // keys, and every tick recalled another line of command history.
+        assert!(!arrows_allowed(&pane), "nobody is left to send arrows to");
+        assert_eq!(
+            wheel_action(false, pane.grid.mouse_tracking, arrows_allowed(&pane)),
+            WheelAction::Viewport,
+            "the tick belongs to our viewport now"
+        );
+        // And the viewport can act on it, rather than the pane being stuck
+        // with no scrollback for the rest of its life.
+        assert_eq!(viewport_target(0, 3, 500, pane.grid.program_owns_screen()), 3);
+    }
+
     #[test]
     fn small_trackpad_deltas_accumulate_into_a_scroll() {
         // A gentle two-finger swipe: ~4px per event against a ~30px row. Each
