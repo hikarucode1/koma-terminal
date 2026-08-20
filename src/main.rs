@@ -80,7 +80,11 @@ impl PaneState {
         // "Killed" line and a fresh prompt — and the prompt is where a shell
         // re-arms the modes it owns. Clearing first lets those land on top;
         // clearing afterwards would wipe them.
-        if self.pty.foreground_returned_to_shell() {
+        // The handover fires after every command, so it is only half the
+        // question; the other half is whether anything was left in a state to
+        // clean up. Short-circuit order matters: the handover has to be asked
+        // first either way, because asking is what consumes the edge.
+        if self.pty.foreground_returned_to_shell() && self.grid.a_program_left_state_behind() {
             self.grid.soft_reset();
         }
         let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };

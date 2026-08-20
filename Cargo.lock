@@ -961,6 +961,7 @@ dependencies = [
  "bytemuck",
  "env_logger",
  "fontdb",
+ "libc",
  "log",
  "pollster",
  "portable-pty",
