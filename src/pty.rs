@@ -134,7 +134,11 @@ impl ForegroundWatch {
     ///   once per read, so a program whose whole life fits between two of them
     ///   is never seen in front, and the shell was never away. Its bytes are
     ///   still parsed, so whatever it set leaks. Sampling is as fine as the
-    ///   stream is chunked and no finer.
+    ///   stream is chunked and no finer. The window is narrower than that
+    ///   description sounds: two attempts to provoke it — repeated kills a
+    ///   third of a second apart, and the same behind 300KB of backlog, on
+    ///   Linux; a program dying 0.02s after starting, on macOS — all still saw
+    ///   the handover. Worth knowing before spending a day chasing it.
     fn sample(&mut self, front: Option<i32>, still_alive: impl Fn(i32) -> bool) -> bool {
         let Some(shell) = self.shell_pgid else { return false };
         // No answer is not the same as "someone else has it": leave the last
