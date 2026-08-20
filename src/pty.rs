@@ -167,21 +167,29 @@ fn foreground_pgid_of(fd: RawFd) -> Option<i32> {
     if pgid < 0 { None } else { Some(pgid) }
 }
 
-/// Whether a process group still exists.
+/// Whether the process that led the job still exists.
 ///
 /// Signal 0 delivers nothing but runs every existence and permission check the
 /// kernel would run for a real signal, which is exactly the question. `EPERM`
-/// is a yes: the group is there, it is simply not ours to signal.
+/// is a yes: it is there, it is simply not ours to signal.
+///
+/// The *leader*, not the group. A group is still alive while any member is,
+/// and a foreground script that leaves a `foo &` behind exits with its group
+/// intact — read that as "only stopped" and the cleanup is suppressed for a
+/// program that really has gone. Worse, it is suppressed forever: the handover
+/// is consumed either way and the shell already holds the terminal, so no
+/// second one is coming. The leader is the job itself, and when the whole job
+/// is stopped the leader is stopped with it.
 #[cfg(unix)]
-fn process_group_alive(pgid: i32) -> bool {
-    if unsafe { libc::kill(-pgid, 0) } == 0 {
+fn job_leader_alive(pgid: i32) -> bool {
+    if unsafe { libc::kill(pgid, 0) } == 0 {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
-fn process_group_alive(_pgid: i32) -> bool {
+fn job_leader_alive(_pgid: i32) -> bool {
     false
 }
 
@@ -258,7 +266,7 @@ impl Pty {
                         let front = watch_fd.and_then(foreground_pgid_of);
                         #[cfg(not(unix))]
                         let front = None;
-                        if watch.sample(front, process_group_alive)
+                        if watch.sample(front, job_leader_alive)
                             && tx.send(FromPty::Handover).is_err()
                         {
                             break;
@@ -296,7 +304,7 @@ impl Pty {
 
     /// The shell's own process group id, for comparing against `foreground_pgid`.
     /// The production path compares the two inside
-    /// `foreground_returned_to_shell`; this is for tests that want to see them
+    /// `ForegroundWatch::sample`; this is for tests that want to see them
     /// separately.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn shell_pgid(&self) -> Option<i32> {
@@ -578,6 +586,33 @@ mod tests {
             "the program's own bytes belong before the handover, not after"
         );
         assert!(!after.is_empty(), "the shell's prompt belongs after it");
+    }
+
+    #[test]
+    fn a_job_that_leaves_a_child_behind_has_still_finished() {
+        // A foreground script that backgrounds something exits with its
+        // process group still populated, because a non-interactive shell has
+        // no job control to put the child anywhere else. Asking whether the
+        // *group* is alive reads that as "only stopped" and suppresses the
+        // cleanup — permanently, since the handover is consumed either way.
+        let mut pty = Pty::spawn(80, 24, || {}).expect("could not open a pty");
+        let shell = pty.shell_pgid().expect("the shell should have a pid");
+        assert!(
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_pgid() == Some(shell)),
+            "the shell never reached a prompt"
+        );
+
+        // The foreground half lives long enough to be seen; the background
+        // half outlives it and keeps the group id in use.
+        // It says something first so the reading catches it in front — see
+        // `a_killed_foreground_job_still_hands_the_terminal_back`.
+        pty.write(b"sh -c 'printf \"\\033[?1002h\"; sleep 5 & sleep 0.5'\n");
+        let events = collect_for(&mut pty, Duration::from_secs(6));
+        pty.kill();
+        assert!(
+            split_at_handover(events).0.is_some(),
+            "the job that held the terminal is gone, child or no child"
+        );
     }
 
     #[test]
