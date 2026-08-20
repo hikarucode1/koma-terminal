@@ -71,21 +71,29 @@ pub struct Pty {
     last_program_pgid: Option<i32>,
 }
 
-/// Whether a process group still exists.
+/// Whether the process that led the job still exists.
 ///
 /// Signal 0 delivers nothing but runs every existence and permission check the
 /// kernel would run for a real signal, which is exactly the question. `EPERM`
-/// is a yes: the group is there, it is simply not ours to signal.
+/// is a yes: it is there, it is simply not ours to signal.
+///
+/// The *leader*, not the group. A group is still alive while any member is,
+/// and a foreground script that leaves a `foo &` behind exits with its group
+/// intact — read that as "only stopped" and the cleanup is suppressed for a
+/// program that really has gone. Worse, it is suppressed forever: the handover
+/// is consumed either way and the shell already holds the terminal, so no
+/// second one is coming. The leader is the job itself, and when the whole job
+/// is stopped the leader is stopped with it.
 #[cfg(unix)]
-fn process_group_alive(pgid: i32) -> bool {
-    if unsafe { libc::kill(-pgid, 0) } == 0 {
+fn job_leader_alive(pgid: i32) -> bool {
+    if unsafe { libc::kill(pgid, 0) } == 0 {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
-fn process_group_alive(_pgid: i32) -> bool {
+fn job_leader_alive(_pgid: i32) -> bool {
     false
 }
 
@@ -195,7 +203,7 @@ impl Pty {
     /// **Suspending is not finishing.** `Ctrl-Z` hands the terminal back just
     /// as dying does, but the program is still there, holding everything it
     /// set and expecting to find it on `fg`. So the handover asks one more
-    /// question — does the group that had the terminal still exist? — and
+    /// question — does the program that had the terminal still exist? — and
     /// stays quiet when it does. A program stopped and then killed while
     /// stopped is therefore never cleaned up: the shell already has the
     /// terminal, so no second handover is coming.
@@ -231,7 +239,7 @@ impl Pty {
         // Taken either way: on `fg` the group takes the terminal again and the
         // branch above records it afresh.
         match self.last_program_pgid.take() {
-            Some(pgid) => !process_group_alive(pgid),
+            Some(pgid) => !job_leader_alive(pgid),
             // Never saw who had it — the handover is all we know, so report it.
             None => true,
         }
@@ -416,6 +424,36 @@ mod tests {
 
         assert!(back, "the shell should hold the terminal while the job is stopped");
         assert!(!reported, "a stopped job is not a finished one");
+    }
+
+    #[test]
+    fn a_job_that_leaves_a_child_behind_has_still_finished() {
+        // A foreground script that backgrounds something exits with its
+        // process group still populated, because a non-interactive shell has
+        // no job control to put the child anywhere else. Asking whether the
+        // *group* is alive reads that as "only stopped" and suppresses the
+        // cleanup — permanently, since the handover is consumed either way.
+        let mut pty = Pty::spawn(80, 24, || {}).expect("could not open a pty");
+        let shell = pty.shell_pgid().expect("the shell should have a pid");
+        assert!(
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_pgid() == Some(shell)),
+            "the shell never reached a prompt"
+        );
+
+        // The foreground half lives long enough to be seen; the background
+        // half outlives it and keeps the group id in use.
+        pty.write(b"sh -c 'sleep 5 & sleep 0.5'\n");
+        assert!(
+            wait_until(&mut pty, Duration::from_secs(20), |p| {
+                p.foreground_pgid().is_some_and(|f| f != shell) && !p.foreground_returned_to_shell()
+            }),
+            "the job never took the terminal"
+        );
+
+        let handed_back =
+            wait_until(&mut pty, Duration::from_secs(20), |p| p.foreground_returned_to_shell());
+        pty.kill();
+        assert!(handed_back, "the job that held the terminal is gone, child or no child");
     }
 
     #[test]

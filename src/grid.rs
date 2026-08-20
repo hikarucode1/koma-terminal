@@ -300,13 +300,30 @@ impl Grid {
     /// would turn it off are parsed, so it is regularly true for reasons that
     /// have nothing to do with a program leaving. Both are still cleared once
     /// something else here has triggered.
+    ///
+    /// Colour is here even though `tput setaf 2` at a prompt is the same shape
+    /// of deliberate state as `tput civis`. A program killed part way through
+    /// writing colour leaves every prompt after it painted, which is the
+    /// commonest reason anyone reaches for `reset`; a prompt-set colour meant
+    /// to last is rare. The trade was made knowingly rather than by omission.
+    ///
+    /// `program_owns_screen`, not `alt_active`: the alternate screen is left
+    /// standing on purpose when its program is killed and nothing will ever
+    /// take it down, so testing `alt_active` here would latch this true for
+    /// the rest of the pane's life — and then every command would reset again,
+    /// which is the behaviour this exists to stop. Every other term is cleared
+    /// by the reset it triggers, and this one has to clear itself the same
+    /// way.
     pub fn a_program_left_state_behind(&self) -> bool {
-        self.alt_active
+        self.program_owns_screen()
             || self.mouse_tracking != MouseTracking::Off
             || self.top != 0
             || self.bot != self.rows - 1
             || self.charsets != [Charset::Ascii; 2]
             || self.gl != 0
+            || self.fg != Color::Default
+            || self.bg != Color::Default
+            || self.flags != 0
     }
 
     /// Whether a full-screen program is actually driving this pane's screen.
@@ -1793,6 +1810,30 @@ mod tests {
         let g = feed(10, 2, &["\x1b[?25l"]);
         assert!(!g.cursor_visible);
         assert!(!g.a_program_left_state_behind());
+    }
+
+    #[test]
+    fn cleaning_up_after_a_program_stops_it_counting_as_left_behind() {
+        // The alternate screen is left standing when its program is killed and
+        // nothing will ever take it down, so it cannot be the term that says
+        // "there is a mess here" — it would say so forever, and every command
+        // after would reset again.
+        let mut g = feed(10, 4, &["\x1b[?1049h", "FULLSCREEN"]);
+        assert!(g.a_program_left_state_behind());
+
+        g.soft_reset();
+        assert!(g.alt_active, "the screen stays up");
+        assert!(!g.a_program_left_state_behind(), "but there is nothing left to clean");
+    }
+
+    #[test]
+    fn colour_left_painted_on_the_screen_counts() {
+        // A program killed part way through writing colour leaves every prompt
+        // after it painted. The reset clears `fg`/`bg`/`flags`, so the trigger
+        // has to be able to see them.
+        let g = feed(10, 4, &["\x1b[41;97m"]);
+        assert!(g.a_program_left_state_behind());
+        assert!(feed(10, 4, &["\x1b[1m"]).a_program_left_state_behind(), "and attributes too");
     }
 
     #[test]

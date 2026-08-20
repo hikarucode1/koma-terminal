@@ -22,7 +22,7 @@ wgpu = "30.0.0"
 winit = "0.30.13"
 
 [target.'cfg(unix)'.dependencies]
-# Only for `kill(pgid, 0)`: whether a process group still exists is how a
-# suspended program is told from one that is gone. Already in the tree by way
-# of portable-pty, so it costs no new compilation.
+# Only for `kill(pgid, 0)`: whether the program that held the terminal still
+# exists is how a suspended one is told from one that is gone. Already in the
+# tree by way of portable-pty, so it costs no new compilation.
 libc = "0.2"
