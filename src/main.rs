@@ -280,6 +280,7 @@ impl App {
             p.pty.kill();
         }
         self.drop_composition_of(id);
+        self.last_notified.remove(&id);
         self.relayout();
         if self.focus == id {
             let mut leaves = Vec::new();
@@ -1165,14 +1166,8 @@ impl App {
             return;
         }
         self.last_notified.insert(id, now);
-        let body = self
-            .panes
-            .get(&id)
-            .map(|p| p.grid.title.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("A pane is waiting for you")
-            .to_string();
-        notify("koma", &body);
+        let title = self.panes.get(&id).map(|p| p.grid.title.as_str()).unwrap_or("");
+        notify("koma", &notification_body(id, title));
     }
 
     fn update_title(&self) {
@@ -1312,9 +1307,13 @@ fn should_notify(window_focused: bool, pane_focused: bool, since_last: Option<Du
 
 /// Escapes a string to sit inside an AppleScript double-quoted literal.
 ///
+/// Only the macOS notifier pastes text into a script; elsewhere the tests are
+/// the only caller, and an unconditional definition is dead code there.
+///
 /// The text is a pane title, which a program sets with OSC 0 and can therefore
 /// contain anything at all — a quote would end the literal early and leave the
 /// rest to be read as script.
+#[cfg(any(target_os = "macos", test))]
 fn applescript_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1329,6 +1328,45 @@ fn applescript_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The longest pane title worth showing. Past this a notification is a wall
+/// of text rather than a glance, and a big enough argument fails to spawn at
+/// all (`E2BIG`) — a title has no length limit on the way in.
+const MAX_NOTIFICATION_CHARS: usize = 120;
+
+/// Turns a pane title into something safe to hand a notification daemon.
+///
+/// A title is whatever a program put in an OSC 0, so it is as untrusted as
+/// anything else that arrives on the pty — a `cat` of a hostile file will do.
+/// It is on its way to a banner that sits above other applications, which is a
+/// good place to pretend to be one of them, so:
+///
+/// - the pane it came from is named, and the text follows a colon, so the body
+///   cannot read as a message from koma itself;
+/// - characters that move the cursor or reorder what follows them are dropped
+///   (`U+202E` alone can print a line backwards); and
+/// - it is cut to a length a person reads rather than scrolls.
+fn notification_body(pane: PaneId, title: &str) -> String {
+    let clean: String = title
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c,
+                    '\u{200b}'..='\u{200f}'    // zero width, and the bidi marks
+                    | '\u{2028}' | '\u{2029}'  // line and paragraph separators
+                    | '\u{202a}'..='\u{202e}'  // bidi embedding and override
+                    | '\u{2066}'..='\u{2069}'  // bidi isolates
+                    | '\u{feff}')
+        })
+        .take(MAX_NOTIFICATION_CHARS)
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        format!("pane {pane} is waiting for you")
+    } else {
+        format!("pane {pane}: {clean}")
+    }
 }
 
 /// Puts a notification in front of the user, by the shortest route each
@@ -1353,10 +1391,17 @@ fn notify(title: &str, body: &str) {
         #[cfg(all(unix, not(target_os = "macos")))]
         let mut cmd = {
             let mut c = std::process::Command::new("notify-send");
-            c.arg(&title).arg(&body);
+            // `--` first: libnotify parses options wherever they appear, so a
+            // title that starts with a dash is read as one and the
+            // notification never goes out.
+            c.arg("--").arg(&title).arg(&body);
             c
         };
-        let _ = cmd.status();
+        // Loud enough to explain a feature that otherwise just never happens —
+        // no notification daemon, no `osascript` — without a line per bell.
+        if let Err(e) = cmd.status() {
+            log::warn!("could not put a notification on screen: {e}");
+        }
     });
 }
 
@@ -1981,6 +2026,31 @@ mod tests {
         assert!(!should_notify(false, false, Some(Duration::from_secs(1))));
         assert!(!should_notify(false, false, Some(NOTIFY_COOLDOWN - Duration::from_millis(1))));
         assert!(should_notify(false, false, Some(NOTIFY_COOLDOWN)), "and then it may again");
+    }
+
+    #[test]
+    fn a_notification_body_says_which_pane_it_came_from() {
+        assert_eq!(notification_body(2, "npm run dev"), "pane 2: npm run dev");
+        // Nothing to say is still worth saying, since the bell rang.
+        assert_eq!(notification_body(7, ""), "pane 7 is waiting for you");
+        assert_eq!(notification_body(7, "   "), "pane 7 is waiting for you");
+    }
+
+    #[test]
+    fn a_title_cannot_reorder_or_pad_its_way_into_looking_like_something_else() {
+        // A pane title is whatever a program put in an OSC 0, and this one is
+        // on its way to a banner sitting above other applications.
+        assert_eq!(
+            notification_body(1, "\u{202e}drowssap ruoy retnE"),
+            "pane 1: drowssap ruoy retnE",
+            "the override that prints a line backwards has to go"
+        );
+        assert_eq!(notification_body(1, "a\u{2028}b\u{feff}c"), "pane 1: abc");
+        assert_eq!(notification_body(1, "a\u{7f}b"), "pane 1: ab", "DEL survives the parser");
+        // Long enough to be a wall of text is long enough to fail to spawn.
+        let huge = "x".repeat(300_000);
+        let body = notification_body(1, &huge);
+        assert_eq!(body.chars().count(), "pane 1: ".chars().count() + MAX_NOTIFICATION_CHARS);
     }
 
     #[test]
