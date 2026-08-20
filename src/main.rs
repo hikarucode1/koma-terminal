@@ -114,6 +114,12 @@ struct App {
     next_id: PaneId,
 
     mods: ModifiersState,
+    /// Whether the OS says this window is the one being typed into. A bell in
+    /// the pane you are already looking at is not news.
+    window_focused: bool,
+    /// When each pane last got a notification out, so a program that rings
+    /// repeatedly cannot turn into a stream of them.
+    last_notified: HashMap<PaneId, Instant>,
     cursor_pos: (f32, f32),
     scale: f32,
     font_pt: f32,
@@ -154,6 +160,8 @@ impl App {
             focus: 0,
             next_id: 1,
             mods: ModifiersState::empty(),
+            window_focused: true,
+            last_notified: HashMap::new(),
             cursor_pos: (0.0, 0.0),
             scale: 1.0,
             font_pt: DEFAULT_FONT_PT,
@@ -870,6 +878,9 @@ impl App {
     fn pump_all(&mut self, event_loop: &ActiveEventLoop) -> bool {
         let mut dirty = false;
         let mut finished: Vec<PaneId> = Vec::new();
+        // Collected rather than acted on in the loop, for the same reason as
+        // the clipboard: every pane is borrowed here.
+        let mut rang: Vec<PaneId> = Vec::new();
         // Collected rather than written as we go, because the clipboard is the
         // app's and we are holding every pane borrowed. Last writer wins, which
         // is what the clipboard means anyway.
@@ -894,6 +905,13 @@ impl App {
             if let Some(text) = p.grid.pending_clipboard.take() {
                 clipboard = Some(text);
             }
+            if std::mem::take(&mut p.grid.bell) {
+                rang.push(id);
+            }
+        }
+
+        for id in rang {
+            self.pane_rang(id);
         }
 
         // Before closing panes: that path can exit the loop, and a copy made on
@@ -1136,6 +1154,27 @@ impl App {
         }
     }
 
+    /// A pane rang its bell. That is the only thing a program running inside
+    /// one can do to say "I need you" — `claude` waiting on a permission
+    /// prompt, a long build finishing — and until now koma parsed it and threw
+    /// it away.
+    fn pane_rang(&mut self, id: PaneId) {
+        let now = Instant::now();
+        let since = self.last_notified.get(&id).map(|t| now.duration_since(*t));
+        if !should_notify(self.window_focused, id == self.focus, since) {
+            return;
+        }
+        self.last_notified.insert(id, now);
+        let body = self
+            .panes
+            .get(&id)
+            .map(|p| p.grid.title.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("A pane is waiting for you")
+            .to_string();
+        notify("koma", &body);
+    }
+
     fn update_title(&self) {
         let Some(w) = &self.window else { return };
         let t = self
@@ -1253,6 +1292,72 @@ enum WheelAction {
     Application,
     /// Drop the tick. Nothing is sent and nothing moves.
     Ignore,
+}
+
+/// How long a pane has to stay quiet before it may interrupt again. A program
+/// that rings once per prompt would otherwise be a stream of notifications.
+const NOTIFY_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Whether a bell should become a notification.
+///
+/// Not when the window is focused *and* the bell came from the pane the user
+/// is already typing in — they are looking straight at it. Any other
+/// combination is a pane asking for attention that nobody is currently on.
+fn should_notify(window_focused: bool, pane_focused: bool, since_last: Option<Duration>) -> bool {
+    if window_focused && pane_focused {
+        return false;
+    }
+    since_last.is_none_or(|d| d >= NOTIFY_COOLDOWN)
+}
+
+/// Escapes a string to sit inside an AppleScript double-quoted literal.
+///
+/// The text is a pane title, which a program sets with OSC 0 and can therefore
+/// contain anything at all — a quote would end the literal early and leave the
+/// rest to be read as script.
+fn applescript_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            // A literal cannot span lines at all, escaped or not.
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Puts a notification in front of the user, by the shortest route each
+/// platform offers that costs us no dependency.
+///
+/// Off the UI thread and waited on there: `osascript` takes a moment to start,
+/// and a child nobody waits for is a zombie until koma exits.
+fn notify(title: &str, body: &str) {
+    let (title, body) = (title.to_string(), body.to_string());
+    std::thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        let mut cmd = {
+            let script = format!(
+                "display notification {} with title {}",
+                applescript_string(&body),
+                applescript_string(&title)
+            );
+            let mut c = std::process::Command::new("osascript");
+            c.arg("-e").arg(script);
+            c
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut cmd = {
+            let mut c = std::process::Command::new("notify-send");
+            c.arg(&title).arg(&body);
+            c
+        };
+        let _ = cmd.status();
+    });
 }
 
 /// Where the viewport lands after scrolling `lines` (positive moves back
@@ -1762,6 +1867,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::Focused(on) => self.window_focused = on,
+
             WindowEvent::RedrawRequested => self.redraw(),
 
             _ => {}
@@ -1857,6 +1964,35 @@ mod tests {
         // And the viewport can act on it, rather than the pane being stuck
         // with no scrollback for the rest of its life.
         assert_eq!(viewport_target(0, 3, 500, pane.grid.program_owns_screen()), 3);
+    }
+
+    #[test]
+    fn the_pane_you_are_typing_in_does_not_interrupt_you() {
+        assert!(!should_notify(true, true, None));
+        // The same pane, with the window in the background, is news again.
+        assert!(should_notify(false, true, None));
+        // And so is another pane while you work in this one.
+        assert!(should_notify(true, false, None));
+    }
+
+    #[test]
+    fn a_pane_that_keeps_ringing_only_interrupts_once() {
+        assert!(should_notify(false, false, None), "the first one always goes");
+        assert!(!should_notify(false, false, Some(Duration::from_secs(1))));
+        assert!(!should_notify(false, false, Some(NOTIFY_COOLDOWN - Duration::from_millis(1))));
+        assert!(should_notify(false, false, Some(NOTIFY_COOLDOWN)), "and then it may again");
+    }
+
+    #[test]
+    fn a_title_cannot_break_out_of_the_applescript_it_is_pasted_into() {
+        assert_eq!(applescript_string("hi"), "\"hi\"");
+        // OSC 0 carries whatever the program sends, including this.
+        assert_eq!(
+            applescript_string("a\" & do shell script \"rm -rf ~\" & \"b"),
+            "\"a\\\" & do shell script \\\"rm -rf ~\\\" & \\\"b\""
+        );
+        assert_eq!(applescript_string("back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(applescript_string("two\nlines"), "\"two lines\"");
     }
 
     #[test]
