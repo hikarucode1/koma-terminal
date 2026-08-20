@@ -114,6 +114,9 @@ struct App {
     next_id: PaneId,
 
     mods: ModifiersState,
+    /// Frames in a row that did not reach the screen. Counted so asking again
+    /// cannot become asking forever — see `ask_again`.
+    dropped_frames: u32,
     /// Whether the OS says this window is the one being typed into. A bell in
     /// the pane you are already looking at is not news.
     window_focused: bool,
@@ -160,6 +163,7 @@ impl App {
             focus: 0,
             next_id: 1,
             mods: ModifiersState::empty(),
+            dropped_frames: 0,
             window_focused: true,
             last_notified: HashMap::new(),
             cursor_pos: (0.0, 0.0),
@@ -1140,12 +1144,33 @@ impl App {
 
         gpu.upload_atlas(&mut fonts.atlas);
         let clear = to_linear(theme.bg, 1.0);
-        if gpu.render(inst, clear) == FrameStatus::NeedsReconfigure {
+        let status = gpu.render(inst, clear);
+        if status == FrameStatus::NeedsReconfigure {
             let (w, h) = (gpu.config.width, gpu.config.height);
             gpu.resize(w, h);
-            if let Some(win) = &self.window {
-                win.request_redraw();
-            }
+        }
+        self.dropped_frames =
+            if status == FrameStatus::Presented { 0 } else { self.dropped_frames + 1 };
+        if status != FrameStatus::Presented {
+            // The only way to find out whether any of this happens on a given
+            // machine. Whether the swapchain ever runs out is a property of the
+            // platform and the compositor, not something the code can settle.
+            log::debug!("frame not presented: {status:?} ({} in a row)", self.dropped_frames);
+        }
+        // A frame that never reached the screen leaves the window showing
+        // something older than the grid, and nothing else is coming to correct
+        // it: redraws are asked for by output arriving and by keys being
+        // pressed, and a pane whose program has gone quiet — one waiting for
+        // input, say — produces neither. That is a pane that looks frozen while
+        // its program is fine, and it comes back the moment anything at all
+        // repaints the window, which is why clicking it "fixes" it.
+        //
+        // Which is also why it reads as one pane rather than the window: the
+        // pane being typed into is repainted by the typing.
+        if ask_again(status, self.dropped_frames)
+            && let Some(win) = &self.window
+        {
+            win.request_redraw();
         }
     }
 
@@ -1287,6 +1312,47 @@ enum WheelAction {
     Application,
     /// Drop the tick. Nothing is sent and nothing moves.
     Ignore,
+}
+
+/// How many frames in a row may be asked for again before koma stops asking.
+///
+/// Enough to cover the case this exists for — a frame or two lost while the
+/// swapchain is busy — and short enough that the failure below is measured in
+/// seconds rather than for as long as the window stays hidden.
+const MAX_DROPPED_FRAME_RETRIES: u32 = 3;
+
+/// Whether a frame that did not reach the screen has to be asked for again,
+/// given how many have failed in a row already (this one included).
+///
+/// `Occluded` is never asked again: the window is not on screen at all, and
+/// winit says so again when it comes back (`WindowEvent::Occluded(false)`),
+/// which is the signal to draw.
+///
+/// **On macOS that is the whole of it.** Measured over fifteen runs against
+/// real Metal, the swapchain never timed out once; every frame that failed to
+/// reach the screen was `Occluded`, and the window was left stale twice while
+/// it sat visible for the better part of a second with nothing asking it to
+/// draw. So the handler for `Occluded(false)` is what repairs the window
+/// there, and the count below has never been reached on that platform — the
+/// `Retry` arm is exercised only by forcing it.
+///
+/// **That escape hatch only exists on macOS**, which is why the count is here.
+/// `SurfaceError::Occluded` is produced in one place in all of wgpu — the
+/// Metal backend — and winit documents `WindowEvent::Occluded` as unsupported
+/// on Wayland, Windows and Android. Minimise koma on Wayland and the
+/// compositor stops handing out frames, so acquiring one hits wgpu's one
+/// second timeout, which arrives here as `Retry`, with nothing on the way to
+/// say the window came back. Asking again each time would rebuild the scene
+/// and block for another second, for as long as the window stayed hidden.
+/// Giving up leaves the window as it was before any of this: the frame is
+/// dropped and koma goes idle until something happens.
+fn ask_again(status: FrameStatus, failures_in_a_row: u32) -> bool {
+    match status {
+        FrameStatus::Retry | FrameStatus::NeedsReconfigure => {
+            failures_in_a_row < MAX_DROPPED_FRAME_RETRIES
+        }
+        FrameStatus::Presented | FrameStatus::Occluded => false,
+    }
 }
 
 /// How long a pane has to stay quiet before it may interrupt again. A program
@@ -1912,6 +1978,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            // Frames dropped while hidden were never asked for again, on
+            // purpose. This is the ask.
+            WindowEvent::Occluded(false) => self.request_redraw(),
             WindowEvent::Focused(on) => self.window_focused = on,
 
             WindowEvent::RedrawRequested => self.redraw(),
@@ -2009,6 +2078,37 @@ mod tests {
         // And the viewport can act on it, rather than the pane being stuck
         // with no scrollback for the rest of its life.
         assert_eq!(viewport_target(0, 3, 500, pane.grid.program_owns_screen()), 3);
+    }
+
+    #[test]
+    fn a_frame_that_never_reached_the_screen_is_asked_for_again() {
+        // The bug this is for: the last frame of a burst is dropped, the
+        // program then waits for input and writes nothing more, and the pane
+        // sits showing the frame before it until something else repaints.
+        assert!(ask_again(FrameStatus::Retry, 1));
+        assert!(ask_again(FrameStatus::NeedsReconfigure, 1));
+        assert!(!ask_again(FrameStatus::Presented, 0));
+    }
+
+    #[test]
+    fn a_hidden_window_is_not_asked_to_draw_in_a_loop() {
+        // Occlusion lasts as long as the user leaves it lasting, and asking
+        // again resolves the same way every time. Waiting to be told it is
+        // visible is the only thing that terminates.
+        assert!(!ask_again(FrameStatus::Occluded, 1));
+    }
+
+    #[test]
+    fn asking_again_gives_up_before_it_becomes_asking_forever() {
+        // Where the `Occluded` answer above is not available — Wayland, where
+        // a hidden window's frames time out instead — nothing arrives to say
+        // the window came back, so the only thing that ends this is counting.
+        for n in 1..MAX_DROPPED_FRAME_RETRIES {
+            assert!(ask_again(FrameStatus::Retry, n), "{n} in a row is still worth retrying");
+        }
+        assert!(!ask_again(FrameStatus::Retry, MAX_DROPPED_FRAME_RETRIES));
+        assert!(!ask_again(FrameStatus::Retry, MAX_DROPPED_FRAME_RETRIES + 1));
+        assert!(!ask_again(FrameStatus::NeedsReconfigure, MAX_DROPPED_FRAME_RETRIES));
     }
 
     #[test]
