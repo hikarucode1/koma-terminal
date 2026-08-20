@@ -29,8 +29,13 @@ impl Inst {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrameStatus {
     Presented,
-    /// Transient — skip this frame, nothing to fix.
-    Skipped,
+    /// The swapchain had nothing free this instant. Nothing is wrong, but the
+    /// frame is gone: whatever it was going to show is still unshown, so
+    /// somebody has to ask again.
+    Retry,
+    /// The window is not on screen. Asking again would spin for as long as it
+    /// stays hidden; the way back is being told it is visible.
+    Occluded,
     /// The swapchain is stale; reconfigure the surface and draw again.
     NeedsReconfigure,
 }
@@ -298,8 +303,8 @@ impl Gpu {
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
             Cst::Success(f) | Cst::Suboptimal(f) => f,
-            // Nothing to present right now; the next redraw will retry.
-            Cst::Timeout | Cst::Occluded => return FrameStatus::Skipped,
+            Cst::Timeout => return FrameStatus::Retry,
+            Cst::Occluded => return FrameStatus::Occluded,
             Cst::Outdated | Cst::Lost | Cst::Validation => return FrameStatus::NeedsReconfigure,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());

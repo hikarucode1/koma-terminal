@@ -1121,12 +1121,22 @@ impl App {
 
         gpu.upload_atlas(&mut fonts.atlas);
         let clear = to_linear(theme.bg, 1.0);
-        if gpu.render(inst, clear) == FrameStatus::NeedsReconfigure {
+        let status = gpu.render(inst, clear);
+        if status == FrameStatus::NeedsReconfigure {
             let (w, h) = (gpu.config.width, gpu.config.height);
             gpu.resize(w, h);
-            if let Some(win) = &self.window {
-                win.request_redraw();
-            }
+        }
+        // A frame that never reached the screen leaves the window showing
+        // something older than the grid, and nothing else is coming to correct
+        // it: redraws are asked for by output arriving and by keys being
+        // pressed, and a pane whose program has gone quiet — one waiting for
+        // input, say — produces neither. That is a pane that looks frozen while
+        // its program is fine, and it comes back the moment anything at all
+        // repaints the window, which is why clicking it "fixes" it.
+        if ask_again(status)
+            && let Some(win) = &self.window
+        {
+            win.request_redraw();
         }
     }
 
@@ -1253,6 +1263,20 @@ enum WheelAction {
     Application,
     /// Drop the tick. Nothing is sent and nothing moves.
     Ignore,
+}
+
+/// Whether a frame that did not reach the screen has to be asked for again.
+///
+/// Only the transient one. `Occluded` means the window is not on screen at
+/// all, and asking again would spin for as long as that lasts — winit says so
+/// again when it comes back (`WindowEvent::Occluded(false)`), which is the
+/// signal to draw. `NeedsReconfigure` has already been dealt with by the time
+/// this is asked, but the frame behind it is just as gone, so it asks too.
+fn ask_again(status: FrameStatus) -> bool {
+    match status {
+        FrameStatus::Retry | FrameStatus::NeedsReconfigure => true,
+        FrameStatus::Presented | FrameStatus::Occluded => false,
+    }
 }
 
 /// Where the viewport lands after scrolling `lines` (positive moves back
@@ -1762,6 +1786,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            // Frames dropped while hidden were never asked for again, on
+            // purpose. This is the ask.
+            WindowEvent::Occluded(false) => self.request_redraw(),
+
             WindowEvent::RedrawRequested => self.redraw(),
 
             _ => {}
@@ -1857,6 +1885,24 @@ mod tests {
         // And the viewport can act on it, rather than the pane being stuck
         // with no scrollback for the rest of its life.
         assert_eq!(viewport_target(0, 3, 500, pane.grid.program_owns_screen()), 3);
+    }
+
+    #[test]
+    fn a_frame_that_never_reached_the_screen_is_asked_for_again() {
+        // The bug this is for: the last frame of a burst is dropped, the
+        // program then waits for input and writes nothing more, and the pane
+        // sits showing the frame before it until something else repaints.
+        assert!(ask_again(FrameStatus::Retry));
+        assert!(ask_again(FrameStatus::NeedsReconfigure));
+        assert!(!ask_again(FrameStatus::Presented));
+    }
+
+    #[test]
+    fn a_hidden_window_is_not_asked_to_draw_in_a_loop() {
+        // Occlusion lasts as long as the user leaves it lasting, and asking
+        // again resolves the same way every time. Waiting to be told it is
+        // visible is the only thing that terminates.
+        assert!(!ask_again(FrameStatus::Occluded));
     }
 
     #[test]
