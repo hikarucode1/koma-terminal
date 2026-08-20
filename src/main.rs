@@ -1132,6 +1132,12 @@ impl App {
         }
         self.dropped_frames =
             if status == FrameStatus::Presented { 0 } else { self.dropped_frames + 1 };
+        if status != FrameStatus::Presented {
+            // The only way to find out whether any of this happens on a given
+            // machine. Whether the swapchain ever runs out is a property of the
+            // platform and the compositor, not something the code can settle.
+            log::debug!("frame not presented: {status:?} ({} in a row)", self.dropped_frames);
+        }
         // A frame that never reached the screen leaves the window showing
         // something older than the grid, and nothing else is coming to correct
         // it: redraws are asked for by output arriving and by keys being
