@@ -76,6 +76,13 @@ impl PaneState {
         if bytes.is_empty() {
             return (false, Vec::new());
         }
+        // Before the bytes, not after. Output arriving now is the shell's — its
+        // "Killed" line and a fresh prompt — and the prompt is where a shell
+        // re-arms the modes it owns. Clearing first lets those land on top;
+        // clearing afterwards would wipe them.
+        if self.pty.foreground_returned_to_shell() {
+            self.grid.soft_reset();
+        }
         let mut perf = grid::Performer { grid: &mut self.grid, reply: Vec::new() };
         self.parser.advance(&mut perf, &bytes);
         let reply = std::mem::take(&mut perf.reply);
@@ -475,8 +482,12 @@ impl App {
         if lines == 0 {
             return;
         }
-        p.grid.view_offset =
-            viewport_target(p.grid.view_offset, lines, p.grid.scrollback.len(), p.grid.alt_active);
+        p.grid.view_offset = viewport_target(
+            p.grid.view_offset,
+            lines,
+            p.grid.scrollback.len(),
+            p.grid.program_owns_screen(),
+        );
     }
 
     /// Scrolling from the wheel or trackpad. On the alternate screen this turns
@@ -495,7 +506,7 @@ impl App {
         let Some(p) = self.panes.get(&id) else { return };
         // 1007 off means the program has said not to synthesise arrows, which
         // is what tmux does once it handles the mouse itself.
-        let arrows_allowed = p.grid.alt_active && p.grid.alternate_scroll;
+        let arrows_allowed = p.grid.program_owns_screen() && p.grid.alternate_scroll;
         match wheel_action(shift, p.grid.mouse_tracking, arrows_allowed) {
             WheelAction::Viewport => self.scroll_pane(id, lines),
             WheelAction::Ignore => {}
@@ -519,7 +530,7 @@ impl App {
     /// live screen is the direction that repairs, never the one that damages.
     fn scroll_to_edge(&mut self, top: bool) {
         let Some(p) = self.panes.get_mut(&self.focus) else { return };
-        if top && p.grid.alt_active {
+        if top && p.grid.program_owns_screen() {
             return;
         }
         p.grid.view_offset = if top { p.grid.scrollback.len() } else { 0 };
@@ -1235,19 +1246,30 @@ enum WheelAction {
 /// Where the viewport lands after scrolling `lines` (positive moves back
 /// through history) from `current`, for a pane holding `scrollback` lines.
 ///
-/// **The alternate screen only allows movement back towards the live screen.**
-/// Scrollback survives the switch — `grid.rs` only stops *pushing* to it while
-/// `alt_active` — so walking up leads into whatever the shell printed before
-/// the program started, and draws it over the program's own screen. The
-/// cursor goes with it (`show_cursor` wants `view_offset == 0`) and the
-/// program's own repaints do not undo it, because the `scroll_up` branch that
-/// resets the offset is closed while `alt_active`. Nothing there is worth
-/// showing: inside tmux or vim it is the screen from before they started.
+/// **A program that owns the screen only allows movement back towards the
+/// live screen.** Scrollback survives the switch to the alternate screen —
+/// `grid.rs` only stops *pushing* to it while `alt_active` — so walking up
+/// leads into whatever the shell printed before the program started, and draws
+/// it over the program's own screen. The cursor goes with it (`show_cursor`
+/// wants `view_offset == 0`) and the program's own repaints do not undo it,
+/// because the `scroll_up` branch that resets the offset is closed while
+/// `alt_active`. Nothing there is worth showing: inside tmux or vim it is the
+/// screen from before they started.
+///
+/// `Grid::program_owns_screen`, not `alt_active`: an alternate screen whose
+/// program was killed has nothing left to protect, and refusing there would
+/// stick the pane with no scrollback for as long as it lives — nobody is
+/// coming to send the `1049l` that would clear it.
 ///
 /// Movement towards 0 stays open on purpose, so an offset that got set some
 /// other way can always be undone rather than stranding the viewport.
-fn viewport_target(current: usize, lines: isize, scrollback: usize, alt_active: bool) -> usize {
-    if alt_active && lines > 0 {
+fn viewport_target(
+    current: usize,
+    lines: isize,
+    scrollback: usize,
+    program_owns_screen: bool,
+) -> usize {
+    if program_owns_screen && lines > 0 {
         return current;
     }
     (current as isize + lines).clamp(0, scrollback as isize) as usize
@@ -1750,6 +1772,81 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Pumps a real pane until `done` holds, or the time runs out. Mirrors how
+    /// the event loop drives `pump`: only when bytes have actually arrived.
+    fn pump_until(
+        pane: &mut PaneState,
+        limit: Duration,
+        done: impl Fn(&PaneState) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            pane.pump();
+            if done(pane) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// What `wheel_scroll` asks of a pane before it decides. Kept next to the
+    /// test that needs it because the pane there is real, not a fixture.
+    fn arrows_allowed(pane: &PaneState) -> bool {
+        pane.grid.program_owns_screen() && pane.grid.alternate_scroll
+    }
+
+    #[test]
+    fn the_wheel_does_not_type_arrows_at_the_prompt_a_killed_program_left() {
+        // Driven by a real shell and a real SIGKILL, because the whole point is
+        // that nothing on the wire marks the end: the program is gone before it
+        // can send `1049l` or `1002l`, and only the kernel knows.
+        let mut pane = PaneState::new(80, 24, || {}).expect("could not open a pty");
+        let shell = pane.pty.shell_pgid().expect("the shell should have a pid");
+        assert!(
+            pump_until(&mut pane, Duration::from_secs(20), |p| p.pty.foreground_pgid()
+                == Some(shell)),
+            "the shell never reached a prompt"
+        );
+
+        // A full-screen program that takes the mouse, the way tmux does.
+        pane.pty.write(
+            b"sh -c 'printf \"\\033[?1049h\\033[?1002h\\033[?1006h\"; sleep 1; kill -9 $$'\n",
+        );
+        assert!(
+            pump_until(&mut pane, Duration::from_secs(20), |p| p.grid.program_owns_screen()
+                && p.grid.mouse_tracking != mouse::Tracking::Off),
+            "the program never got the alternate screen and the mouse"
+        );
+        // While it is alive the wheel is its business, which is what `less`
+        // and `man` depend on.
+        assert!(arrows_allowed(&pane), "a live program still gets alternate scroll");
+
+        // Now it is killed. The shell takes the terminal back and prints over
+        // whatever was on screen.
+        assert!(
+            pump_until(&mut pane, Duration::from_secs(20), |p| !p.grid.program_owns_screen()),
+            "the pane never noticed the program had gone"
+        );
+        pane.pty.kill();
+
+        assert!(pane.grid.alt_active, "the last frame the program drew stays up");
+        assert_eq!(pane.grid.mouse_tracking, mouse::Tracking::Off, "the mouse is ours again");
+
+        // The bug this is here for: with the screen still flagged as the
+        // alternate one, the wheel used to be handed to the shell as arrow
+        // keys, and every tick recalled another line of command history.
+        assert!(!arrows_allowed(&pane), "nobody is left to send arrows to");
+        assert_eq!(
+            wheel_action(false, pane.grid.mouse_tracking, arrows_allowed(&pane)),
+            WheelAction::Viewport,
+            "the tick belongs to our viewport now"
+        );
+        // And the viewport can act on it, rather than the pane being stuck
+        // with no scrollback for the rest of its life.
+        assert_eq!(viewport_target(0, 3, 500, pane.grid.program_owns_screen()), 3);
+    }
+
     #[test]
     fn small_trackpad_deltas_accumulate_into_a_scroll() {
         // A gentle two-finger swipe: ~4px per event against a ~30px row. Each
@@ -2115,6 +2212,13 @@ mod tests {
         // Shift+PageUp is the same damage by another key, so it is the same
         // answer: the rule lives here, below every scrollback entry point.
         assert_eq!(viewport_target(0, 40, 500, true), 0);
+    }
+
+    #[test]
+    fn an_orphaned_alternate_screen_scrolls_again() {
+        // A killed program leaves the alternate screen up forever, so the
+        // refusal above must not outlive the program it protects.
+        assert_eq!(viewport_target(0, 3, 500, false), 3);
     }
 
     #[test]
