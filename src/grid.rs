@@ -153,6 +153,12 @@ pub struct Grid {
     /// Alternate screen buffer, saved main screen while active.
     alt: Option<(Vec<Cell>, usize, usize)>,
     pub alt_active: bool,
+    /// Set when the alternate screen outlives the program that raised it. A
+    /// killed program sends no `1049l`, so `alt_active` stays true with nobody
+    /// behind it — and nobody left to ever set it false. Only `soft_reset`
+    /// puts a pane here, so an environment where that never fires never sees
+    /// this either, and behaves exactly as it did before.
+    alt_orphaned: bool,
 }
 
 /// Moves the top `count` rows of `buf` into `scrollback`, trimming to `max` and
@@ -211,6 +217,7 @@ impl Grid {
             alternate_scroll: true,
             alt: None,
             alt_active: false,
+            alt_orphaned: false,
         }
     }
 
@@ -264,6 +271,20 @@ impl Grid {
         self.bg = Color::Default;
         self.flags = 0;
         self.wrap_pending = false;
+        // The alternate screen stays up, as decided above — but whoever raised
+        // it is gone. Remembering that is what stops the wheel typing arrows
+        // at the recovered prompt, and what lets the viewport move again.
+        self.alt_orphaned = self.alt_active;
+    }
+
+    /// Whether a full-screen program is actually driving this pane's screen.
+    ///
+    /// Not the same question as `alt_active`: once a program is killed the
+    /// alternate screen stays up with no one behind it, and then there is
+    /// nobody to send the wheel to and no screen worth keeping the viewport
+    /// off. See `alt_orphaned`.
+    pub fn program_owns_screen(&self) -> bool {
+        self.alt_active && !self.alt_orphaned
     }
 
     /// Row `y` of the current viewport, accounting for scrollback offset.
@@ -588,6 +609,10 @@ impl Grid {
     }
 
     fn set_alt_screen(&mut self, on: bool) {
+        // Before the early return, not after. A program that takes a screen
+        // which is already up — vim started after a killed tmux, whose `1049h`
+        // finds `alt_active` already true — is not inheriting the orphan.
+        self.alt_orphaned = false;
         if on == self.alt_active {
             return;
         }
@@ -1107,6 +1132,55 @@ mod tests {
         // This is a reset of modes, not of the display.
         assert_eq!(g.cells.iter().map(|c| c.c).collect::<Vec<_>>(), screen);
         assert_eq!(g.scrollback.len(), 2, "history from before the program is still there");
+    }
+
+    #[test]
+    fn a_killed_program_leaves_the_alternate_screen_orphaned() {
+        let mut g = feed(20, 2, &["one\r\n", "\x1b[?1049h", "FULLSCREEN"]);
+        assert!(g.program_owns_screen(), "the program is still there");
+
+        g.soft_reset();
+        assert!(g.alt_active, "the last frame it drew stays on screen");
+        assert!(!g.program_owns_screen(), "but nobody is behind it now");
+    }
+
+    #[test]
+    fn a_program_taking_a_screen_that_is_already_up_is_not_an_orphan() {
+        // vim started after a killed tmux: its `1049h` arrives with
+        // `alt_active` already true, which is the path that takes the early
+        // return out of `set_alt_screen`.
+        let mut g = feed(20, 2, &["\x1b[?1049h", "TMUX"]);
+        g.soft_reset();
+        assert!(!g.program_owns_screen());
+
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\x1b[?1049h");
+        assert!(g.alt_active);
+        assert!(g.program_owns_screen(), "vim owns the screen it just asked for");
+    }
+
+    #[test]
+    fn leaving_the_alternate_screen_clears_the_orphan() {
+        let mut g = feed(20, 2, &["\x1b[?1049h", "TMUX"]);
+        g.soft_reset();
+        assert!(!g.program_owns_screen());
+
+        let mut parser = vte::Parser::new();
+        let mut perf = Performer { grid: &mut g, reply: Vec::new() };
+        parser.advance(&mut perf, b"\x1b[?1049l");
+        assert!(!g.alt_active);
+        assert!(!g.program_owns_screen(), "the main screen is nobody's to own");
+    }
+
+    #[test]
+    fn a_soft_reset_on_the_main_screen_orphans_nothing() {
+        // The common case by far: an ordinary command finished. Nothing about
+        // the screen changes, so nothing here may either.
+        let mut g = feed(20, 2, &["one\r\ntwo\r\n"]);
+        g.soft_reset();
+        assert!(!g.alt_active);
+        assert!(!g.program_owns_screen());
     }
 
     #[test]

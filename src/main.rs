@@ -482,8 +482,12 @@ impl App {
         if lines == 0 {
             return;
         }
-        p.grid.view_offset =
-            viewport_target(p.grid.view_offset, lines, p.grid.scrollback.len(), p.grid.alt_active);
+        p.grid.view_offset = viewport_target(
+            p.grid.view_offset,
+            lines,
+            p.grid.scrollback.len(),
+            p.grid.program_owns_screen(),
+        );
     }
 
     /// Scrolling from the wheel or trackpad. On the alternate screen this turns
@@ -502,7 +506,7 @@ impl App {
         let Some(p) = self.panes.get(&id) else { return };
         // 1007 off means the program has said not to synthesise arrows, which
         // is what tmux does once it handles the mouse itself.
-        let arrows_allowed = p.grid.alt_active && p.grid.alternate_scroll;
+        let arrows_allowed = p.grid.program_owns_screen() && p.grid.alternate_scroll;
         match wheel_action(shift, p.grid.mouse_tracking, arrows_allowed) {
             WheelAction::Viewport => self.scroll_pane(id, lines),
             WheelAction::Ignore => {}
@@ -526,7 +530,7 @@ impl App {
     /// live screen is the direction that repairs, never the one that damages.
     fn scroll_to_edge(&mut self, top: bool) {
         let Some(p) = self.panes.get_mut(&self.focus) else { return };
-        if top && p.grid.alt_active {
+        if top && p.grid.program_owns_screen() {
             return;
         }
         p.grid.view_offset = if top { p.grid.scrollback.len() } else { 0 };
@@ -1242,19 +1246,30 @@ enum WheelAction {
 /// Where the viewport lands after scrolling `lines` (positive moves back
 /// through history) from `current`, for a pane holding `scrollback` lines.
 ///
-/// **The alternate screen only allows movement back towards the live screen.**
-/// Scrollback survives the switch — `grid.rs` only stops *pushing* to it while
-/// `alt_active` — so walking up leads into whatever the shell printed before
-/// the program started, and draws it over the program's own screen. The
-/// cursor goes with it (`show_cursor` wants `view_offset == 0`) and the
-/// program's own repaints do not undo it, because the `scroll_up` branch that
-/// resets the offset is closed while `alt_active`. Nothing there is worth
-/// showing: inside tmux or vim it is the screen from before they started.
+/// **A program that owns the screen only allows movement back towards the
+/// live screen.** Scrollback survives the switch to the alternate screen —
+/// `grid.rs` only stops *pushing* to it while `alt_active` — so walking up
+/// leads into whatever the shell printed before the program started, and draws
+/// it over the program's own screen. The cursor goes with it (`show_cursor`
+/// wants `view_offset == 0`) and the program's own repaints do not undo it,
+/// because the `scroll_up` branch that resets the offset is closed while
+/// `alt_active`. Nothing there is worth showing: inside tmux or vim it is the
+/// screen from before they started.
+///
+/// `Grid::program_owns_screen`, not `alt_active`: an alternate screen whose
+/// program was killed has nothing left to protect, and refusing there would
+/// stick the pane with no scrollback for as long as it lives — nobody is
+/// coming to send the `1049l` that would clear it.
 ///
 /// Movement towards 0 stays open on purpose, so an offset that got set some
 /// other way can always be undone rather than stranding the viewport.
-fn viewport_target(current: usize, lines: isize, scrollback: usize, alt_active: bool) -> usize {
-    if alt_active && lines > 0 {
+fn viewport_target(
+    current: usize,
+    lines: isize,
+    scrollback: usize,
+    program_owns_screen: bool,
+) -> usize {
+    if program_owns_screen && lines > 0 {
         return current;
     }
     (current as isize + lines).clamp(0, scrollback as isize) as usize
@@ -2122,6 +2137,13 @@ mod tests {
         // Shift+PageUp is the same damage by another key, so it is the same
         // answer: the rule lives here, below every scrollback entry point.
         assert_eq!(viewport_target(0, 40, 500, true), 0);
+    }
+
+    #[test]
+    fn an_orphaned_alternate_screen_scrolls_again() {
+        // A killed program leaves the alternate screen up forever, so the
+        // refusal above must not outlive the program it protects.
+        assert_eq!(viewport_target(0, 3, 500, false), 3);
     }
 
     #[test]

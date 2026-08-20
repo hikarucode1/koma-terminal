@@ -169,10 +169,19 @@ impl Pty {
     /// so. Callers use it to undo what the program left set — see
     /// `Grid::soft_reset`.
     ///
-    /// Silent where the shell runs without job control (`set +m`, or a
-    /// non-interactive shell): jobs then share the shell's own group, so there
-    /// is no handover to see and this never fires. That is the old behaviour,
-    /// not a new failure.
+    /// Two ways this stays silent. Both leave the old behaviour in place
+    /// rather than introducing a new failure, but neither is narrow:
+    ///
+    /// - **No job control** (`set +m`, or a non-interactive shell): jobs share
+    ///   the shell's own group, so there is no handover to see.
+    /// - **A nested shell in front.** The comparison is against the *top*
+    ///   shell's pgid — the one koma spawned — so anything that puts another
+    ///   shell between it and the program hides the handover completely:
+    ///   `ssh host`, `su`, `docker exec -it`, or a plain `bash`. Kill a
+    ///   mouse-enabled program inside any of those and the terminal goes back
+    ///   to the *inner* shell's group, which never equals `shell_pgid`. Over
+    ///   ssh — the case koma is most used through — issue #19's symptom is
+    ///   therefore untouched.
     pub fn foreground_returned_to_shell(&mut self) -> bool {
         let Some(shell) = self.shell_pgid else { return false };
         // No answer is not the same as "someone else has it": leave the last
