@@ -268,6 +268,12 @@ impl Grid {
 
     /// Row `y` of the current viewport, accounting for scrollback offset.
     /// Returns `None` for rows that predate the retained scrollback.
+    ///
+    /// `view_offset != 0` means the same thing on the alternate screen as on
+    /// the main one, and there is deliberately no `alt_active` guard here: the
+    /// top `view_offset` rows come from history the shell wrote before the
+    /// full-screen program started, and they cover the program's own rows.
+    /// Whoever moves `view_offset` owns getting it back to 0.
     pub fn view_row(&self, y: usize) -> Option<&[Cell]> {
         if self.view_offset == 0 {
             let s = y * self.cols;
@@ -1101,6 +1107,35 @@ mod tests {
         // This is a reset of modes, not of the display.
         assert_eq!(g.cells.iter().map(|c| c.c).collect::<Vec<_>>(), screen);
         assert_eq!(g.scrollback.len(), 2, "history from before the program is still there");
+    }
+
+    #[test]
+    fn the_alternate_screen_does_not_stop_the_viewport_scrolling_back() {
+        // The measurement behind issue #20. `scroll_pane`'s doc comment used to
+        // claim this was a no-op on the alternate screen and that no scrollback
+        // was kept; a wheel fix was then reasoned out from that and broke. Both
+        // halves are false, so pin them down.
+        //
+        // Note this is what the *grid* will do, not what koma does: the App
+        // layer now refuses to move `view_offset` away from 0 while the
+        // alternate screen is up (`viewport_target`). The capability stays
+        // here so that rule keeps being a policy someone chose, visible in one
+        // place, rather than an accident of the data structure.
+        let mut g = feed(20, 2, &["one\r\ntwo\r\nthree\r\n", "\x1b[?1049h", "FULLSCREEN"]);
+        assert!(g.alt_active);
+        assert_eq!(g.scrollback.len(), 2, "scrollback survives the switch");
+
+        let row0 = |g: &Grid| -> String {
+            g.view_row(0).unwrap().iter().map(|c| c.c).collect::<String>().trim_end().to_string()
+        };
+        assert_eq!(row0(&g), "FULLSCREEN");
+        g.view_offset = 1;
+        assert_eq!(row0(&g), "two", "pre-program history covers the program's row");
+
+        // And the program cannot repaint its way out: the branch that resets
+        // view_offset is closed while alt_active.
+        g.scroll_up(1);
+        assert_eq!(g.view_offset, 1);
     }
 
     #[test]
